@@ -61,7 +61,7 @@ class Nft extends Model
         return $this->belongsTo(Collection::class);
     }
 
-    // Price after discount calculate করুন
+    // Price after discount calculate 
     public function getCalculatedPriceAttribute(): float
     {
         if ($this->is_free_listing) return 0;
