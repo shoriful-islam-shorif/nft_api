@@ -4,7 +4,7 @@
         "Read more about it at https://getcomposer.org/doc/01-basic-usage.md#installing-dependencies",
         "This file is @generated automatically"
     ],
-    "content-hash": "53b5d56b3b7e3cbac1713e68c8850f6c",
+    "content-hash": "b140d6ba9302ddf904f7bb481c4e6ced",
     "packages": [
         {
             "name": "brick/math",
@@ -3299,6 +3299,43 @@
                 "source": "https://github.com/ramsey/uuid/tree/4.9.2"
             },
             "time": "2025-12-14T04:43:48+00:00"
+        },
+        {
+            "name": "sultanul-arefin/log-viewer",
+            "version": "1.4.1",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/Sultanul-Arefin/laravel-log-viewer.git",
+                "reference": "86c5e7d586590444cd9661ac5fd0188bff2f99f3"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/Sultanul-Arefin/laravel-log-viewer/zipball/86c5e7d586590444cd9661ac5fd0188bff2f99f3",
+                "reference": "86c5e7d586590444cd9661ac5fd0188bff2f99f3",
+                "shasum": ""
+            },
+            "type": "library",
+            "autoload": {
+                "psr-4": {
+                    "SultanulArefin\\LogViewer\\": "src/"
+                }
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "MIT"
+            ],
+            "authors": [
+                {
+                    "name": "Sultanul-Arefin",
+                    "email": "fahimsultan4@gmail.com"
+                }
+            ],
+            "description": "See laravel logs with more beautiful and flexible way",
+            "support": {
+                "issues": "https://github.com/Sultanul-Arefin/laravel-log-viewer/issues",
+                "source": "https://github.com/Sultanul-Arefin/laravel-log-viewer/tree/1.4.1"
+            },
+            "time": "2026-04-25T20:36:08+00:00"
         },
         {
             "name": "symfony/clock",

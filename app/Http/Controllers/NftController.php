@@ -9,6 +9,7 @@ use App\Services\SolanaService;
 use Illuminate\Http\Request;
 use Illuminate\Http\JsonResponse;
 
+
 class NftController extends Controller
 {
     const NETWORK_FEE_SOL = 0.00001;
@@ -30,44 +31,84 @@ class NftController extends Controller
      */
     public function create(Request $request): JsonResponse
     {
-        // ── Validation ───────────────────────────────
-        $request->validate([
-            // Wallet (Identity)
-            'wallet_address'          => 'required|string',
+        // // ── Validation ───────────────────────────────
+        // $request->validate([
+        //     // Wallet (Identity)
+        //     'wallet_address'          => 'required|string',
 
-            // Basic Info
-            'name'                    => 'required|string|max:100',
-            'description'             => 'required|string|max:1000',
-            'symbol'                  => 'nullable|string|max:10',
-            'image'                   => 'required|file|mimes:jpg,jpeg,png,gif,webp|max:10240',
+        //     // Basic Info
+        //     'name'                    => 'required|string|max:100',
+        //     'description'             => 'required|string|max:1000',
+        //     'symbol'                  => 'nullable|string|max:10',
+        //     'image'                   => 'required|file|mimes:jpg,jpeg,png,gif,webp|max:10240',
 
-            // Collection
-            'collection_id'           => 'nullable|exists:collections,id',
-            'category'                => 'required|in:' . implode(',', self::CATEGORIES),
+        //     // Collection
+        //     'collection_id'           => 'nullable|exists:collections,id',
+        //     'category'                => 'required|in:' . implode(',', self::CATEGORIES),
 
-            // Supply
-            'edition_type'            => 'required|in:unlimited,limited',
-            'total_supply'            => 'required_if:edition_type,limited|nullable|integer|min:1|max:100000',
+        //     // Supply
+        //     'edition_type'            => 'required|in:unlimited,limited',
+        //     'total_supply'            => 'required_if:edition_type,limited|nullable|integer|min:1|max:100000',
 
-            // Pricing
-            'mint_price'              => 'required|numeric|min:0',
-            'is_free_listing'         => 'boolean',
+        //     // Pricing
+        //     'mint_price'              => 'required|numeric|min:0',
+        //     'is_free_listing'         => 'boolean',
 
-            // Mint Discount
-            'has_mint_discount'       => 'boolean',
-            'mint_discount_percent'   => 'required_if:has_mint_discount,true|nullable|numeric|min:1|max:90',
+        //     // Mint Discount
+        //     'has_mint_discount'       => 'boolean',
+        //     'mint_discount_percent'   => 'required_if:has_mint_discount,true|nullable|numeric|min:1|max:90',
 
-            // Buyer Discount
-            'has_buyer_discount'      => 'boolean',
-            'buyer_discount_percent'  => 'required_if:has_buyer_discount,true|nullable|numeric|min:1|max:90',
-            'buyer_discount_max_uses' => 'nullable|integer|min:1',
+        //     // Buyer Discount
+        //     'has_buyer_discount'      => 'boolean',
+        //     'buyer_discount_percent'  => 'required_if:has_buyer_discount,true|nullable|numeric|min:1|max:90',
+        //     'buyer_discount_max_uses' => 'nullable|integer|min:1',
 
-            // Royalty & Attributes
-            'royalty'                 => 'nullable|numeric|min:0|max:50',
-            'attributes'              => 'nullable|array',
-            'attributes.*.trait_type' => 'required|string',
-            'attributes.*.value'      => 'required|string',
-        ]);
+        //     // Royalty & Attributes
+        //     'royalty'                 => 'nullable|numeric|min:0|max:50',
+        //     'attributes'              => 'nullable|array',
+        //     'attributes.*.trait_type' => 'required|string',
+        //     'attributes.*.value'      => 'required|string',
+        // ]);
+
+          $validator = \Validator::make($request->all(), [
+        'wallet_address'          => 'required|string',
+        'name'                    => 'required|string|max:100',
+        'description'             => 'required|string|max:1000',
+        'symbol'                  => 'nullable|string|max:10',
+        'image'                   => 'required|file|mimes:jpg,jpeg,png,gif,webp|max:10240',
+
+        'collection_id'           => 'nullable|exists:collections,id',
+        'category'                => 'required|in:' . implode(',', self::CATEGORIES),
+
+        'edition_type'            => 'required|in:unlimited,limited',
+        'total_supply'            => 'required_if:edition_type,limited|nullable|integer|min:1|max:100000',
+
+        'mint_price'              => 'required|numeric|min:0',
+        'is_free_listing'         => 'boolean',
+
+        'has_mint_discount'       => 'boolean',
+        'mint_discount_percent'   => 'nullable|numeric|min:1|max:90',
+
+        'has_buyer_discount'      => 'boolean',
+        'buyer_discount_percent'  => 'nullable|numeric|min:1|max:90',
+        'buyer_discount_max_uses' => 'nullable|integer|min:1',
+
+        'royalty'                 => 'nullable|numeric|min:0|max:50',
+        'attributes'             => 'nullable|array',
+        'attributes.*.trait_type' => 'required|string',
+        'attributes.*.value'      => 'required|string',
+    ]);
+
+    // ❌ RETURN JSON (NO REDIRECT)
+    if ($validator->fails()) {
+        return response()->json([
+            'success' => false,
+            'message' => 'Validation error',
+            'errors'  => $validator->errors(),
+        ], 422);
+    }
+
+    $data = $validator->validated();
 
         // ── Wallet Validate ──────────────────────────
         if (!$this->solana->isValidWalletAddress($request->wallet_address)) {
@@ -185,6 +226,57 @@ class NftController extends Controller
      * Mint Confirm — Frontend mint after call 
      * POST /api/nft/mint
      */
+    // public function mint(Request $request): JsonResponse
+    // {
+    //     $request->validate([
+    //         'nft_id'          => 'required|exists:nfts,id',
+    //         'mint_address'    => 'required|string',
+    //         'transaction_sig' => 'required|string',
+    //         'wallet_address'  => 'required|string',
+    //     ]);
+    //      \Log::info('Mint Request', [
+    //     'signature' => $request->transaction_sig,
+    //     'mint'      => $request->mint_address,
+    //     ]);
+
+    //     try {
+    //         $transaction = $this->solana->getTransaction($request->transaction_sig);
+
+    //         if (!$transaction) {
+    //             return response()->json([
+    //                 'success' => false,
+    //                 'message' => 'Transaction not confirmed yet. Please wait.',
+    //             ], 422);
+    //         }
+
+    //         $nft = Nft::findOrFail($request->nft_id);
+    //         $nft->update([
+    //             'mint_address'    => $request->mint_address,
+    //             'transaction_sig' => $request->transaction_sig,
+    //             'status'          => 'minted',
+    //             'minted_at'       => now(),
+    //             'minted_count'    => 1,
+    //         ]);
+
+    //         return response()->json([
+    //             'success' => true,
+    //             'message' => 'NFT minted successfully! ✅',
+    //             'data'    => [
+    //                 'mint_address' => $request->mint_address,
+    //                 'transaction'  => $request->transaction_sig,
+    //                 'explorer_url' => $this->solana->getExplorerUrl($request->mint_address),
+    //                 'wallet'       => $request->wallet_address,
+    //             ],
+    //         ]);
+
+    //     } catch (\Exception $e) {
+    //         return response()->json([
+    //             'success' => false,
+    //             'message' => $e->getMessage(),
+    //         ], 500);
+    //     }
+    // }
+
     public function mint(Request $request): JsonResponse
     {
         $request->validate([
@@ -194,13 +286,31 @@ class NftController extends Controller
             'wallet_address'  => 'required|string',
         ]);
 
+        \Log::info('Mint confirm request received', [
+            'nft_id'          => $request->nft_id,
+            'mint_address'    => $request->mint_address,
+            'transaction_sig' => $request->transaction_sig,
+        ]);
+
         try {
+            // Primary check: full transaction lookup (has retry built in)
             $transaction = $this->solana->getTransaction($request->transaction_sig);
 
-            if (!$transaction) {
+            // Fallback check: lighter-weight signature status lookup.
+            // Some RPC providers index getTransaction slower than
+            // getSignatureStatuses, so this catches cases where the
+            // primary check still misses despite retries.
+            $verified = $transaction !== null
+                || $this->solana->isSignatureConfirmed($request->transaction_sig);
+
+            if (!$verified) {
+                \Log::warning('Mint confirm failed verification', [
+                    'transaction_sig' => $request->transaction_sig,
+                ]);
+
                 return response()->json([
                     'success' => false,
-                    'message' => 'Transaction not confirmed yet. Please wait.',
+                    'message' => 'Transaction not confirmed yet. Please wait a moment and try again.',
                 ], 422);
             }
 

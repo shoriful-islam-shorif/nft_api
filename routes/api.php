@@ -4,31 +4,35 @@ use Illuminate\Support\Facades\Route;
 use App\Http\Controllers\NftController;
 use App\Http\Controllers\IpfsController;
 use App\Http\Controllers\WalletController;
+use App\Http\Controllers\CollectionController;
 
-// ── Health Check ──────────────────────────
+// Health
 Route::get('/health', fn() => response()->json(['status' => 'ok', 'message' => 'NFT API Running']));
 
-// ── Wallet ────────────────────────────────
+// Wallet
 Route::prefix('wallet')->group(function () {
-    Route::post('/verify',        [WalletController::class, 'verify']);    // Wallet + balance check
-    Route::get('/nfts/{address}', [WalletController::class, 'getNfts']);   // Chain NFT list
+    Route::post('/verify',        [WalletController::class, 'verify']);
+    Route::get('/nfts/{address}', [WalletController::class, 'getNfts']);
 });
 
-// ── IPFS / Pinata ─────────────────────────
+// IPFS
 Route::prefix('ipfs')->group(function () {
     Route::post('/upload-image',    [IpfsController::class, 'uploadImage']);
     Route::post('/upload-metadata', [IpfsController::class, 'uploadMetadata']);
     Route::delete('/unpin/{hash}',  [IpfsController::class, 'unpin']);
 });
 
-// ── NFT ───────────────────────────────────
-Route::prefix('nft')->group(function () {
-    Route::post('/create',       [NftController::class, 'create']);        // NFT Create
-    Route::post('/mint',         [NftController::class, 'mint']);          // Mint confirm
-    Route::post('/calculate',    [NftController::class, 'calculate']);     // Price calculate
-    Route::get('/list/{wallet}', [NftController::class, 'listByWallet']); // Wallet NFT list
-    Route::get('/{mint_address}',[NftController::class, 'show']);          // Single NFT
+// Collections
+Route::prefix('collections')->group(function () {
+    Route::get('/',    [CollectionController::class, 'index']);  // list
+    Route::post('/',   [CollectionController::class, 'store']);  // create
 });
 
-// ── Collections ───────────────────────────
-Route::get('/collections', [NftController::class, 'collections']); // Collection list
+// NFT
+Route::prefix('nft')->group(function () {
+    Route::post('/create',        [NftController::class, 'create']);
+    Route::post('/mint',          [NftController::class, 'mint']);
+    Route::post('/calculate',     [NftController::class, 'calculate']);
+    Route::get('/list/{wallet}',  [NftController::class, 'listByWallet']);
+    Route::get('/{mint_address}', [NftController::class, 'show']);
+});
