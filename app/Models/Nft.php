@@ -42,7 +42,9 @@ class Nft extends Model
         'wallet_address', 'mint_address', 'transaction_sig',
 
         // Status
-        'status', 'minted_at',
+        'status', 'minted_at','is_listed', 'list_price', 'listed_at',
+
+        
     ];
 
     protected $casts = [
@@ -53,6 +55,9 @@ class Nft extends Model
         'mint_price'         => 'float',
         'price_after_discount' => 'float',
         'network_fee'        => 'float',
+        'is_listed'  => 'boolean',
+        'list_price' => 'float',
+        'listed_at'  => 'datetime'
     ];
 
     // Collection relation

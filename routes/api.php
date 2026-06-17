@@ -5,6 +5,7 @@ use App\Http\Controllers\NftController;
 use App\Http\Controllers\IpfsController;
 use App\Http\Controllers\WalletController;
 use App\Http\Controllers\CollectionController;
+use App\Http\Controllers\MarketplaceController;
 
 // Health
 Route::get('/health', fn() => response()->json(['status' => 'ok', 'message' => 'NFT API Running']));
@@ -35,4 +36,12 @@ Route::prefix('nft')->group(function () {
     Route::post('/calculate',     [NftController::class, 'calculate']);
     Route::get('/list/{wallet}',  [NftController::class, 'listByWallet']);
     Route::get('/{mint_address}', [NftController::class, 'show']);
+});
+
+// Marketplace
+Route::prefix('marketplace')->group(function () {
+    Route::get('/',                 [MarketplaceController::class, 'index']);
+    Route::post('/list',            [MarketplaceController::class, 'list']);
+    Route::post('/unlist',          [MarketplaceController::class, 'unlist']);
+    Route::get('/my-nfts/{wallet}', [MarketplaceController::class, 'myNfts']);
 });
