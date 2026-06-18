@@ -1,5 +1,6 @@
 <?php
 
+use App\Http\Controllers\BuyController;
 use Illuminate\Support\Facades\Route;
 use App\Http\Controllers\NftController;
 use App\Http\Controllers\IpfsController;
@@ -44,4 +45,10 @@ Route::prefix('marketplace')->group(function () {
     Route::post('/list',            [MarketplaceController::class, 'list']);
     Route::post('/unlist',          [MarketplaceController::class, 'unlist']);
     Route::get('/my-nfts/{wallet}', [MarketplaceController::class, 'myNfts']);
+});
+
+// Buy
+Route::prefix('buy')->group(function () {
+    Route::get('/prepare/{nft_id}', [BuyController::class, 'prepare']);
+    Route::post('/confirm',         [BuyController::class, 'confirm']);
 });

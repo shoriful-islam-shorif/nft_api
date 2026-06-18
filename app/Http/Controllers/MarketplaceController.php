@@ -9,15 +9,15 @@ use Illuminate\Http\JsonResponse;
 class MarketplaceController extends Controller
 {
     /**
-     * Marketplace — listed NFT গুলো দেখাও
+     * Marketplace — listed NFT 
      * GET /api/marketplace
      */
     public function index(Request $request): JsonResponse
     {
         $query = Nft::where('status', 'minted')
             ->where('is_listed', true)
-            ->with('collection')
-            ->latest('listed_at');
+            ->with('collection');
+            
 
         if ($request->category && $request->category !== 'all') {
             $query->where('category', $request->category);
@@ -31,7 +31,9 @@ class MarketplaceController extends Controller
             $query->orderBy('list_price', 'asc');
         } elseif ($request->sort === 'price_desc') {
             $query->orderBy('list_price', 'desc');
-        }
+        }else {
+        $query->latest('listed_at');
+    }
 
         $nfts = $query->paginate(12);
 
@@ -55,7 +57,7 @@ class MarketplaceController extends Controller
 
         $nft = Nft::findOrFail($request->nft_id);
 
-        // শুধু owner list করতে পারবে
+        // only owner can list 
         if ($nft->wallet_address !== $request->wallet_address) {
             return response()->json([
                 'success' => false,
@@ -116,7 +118,7 @@ class MarketplaceController extends Controller
     }
 
     /**
-     * My NFTs (wallet এর সব minted NFT)
+     * My NFTs (wallet at minted NFT)
      * GET /api/marketplace/my-nfts/{wallet}
      */
     public function myNfts(string $wallet): JsonResponse

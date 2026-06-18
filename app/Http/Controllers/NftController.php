@@ -16,7 +16,8 @@ class NftController extends Controller
 
     const CATEGORIES = [
         'art', 'music', 'gaming', 'sports',
-        'photography', 'collectible', 'utility', 'other'
+        'photography', 'collectible', 'utility', 'other',
+        'fashion', 'jewelry', 'video', 'digital',
     ];
 
     public function __construct(
@@ -334,11 +335,39 @@ class NftController extends Controller
                 ],
             ]);
 
-        } catch (\Exception $e) {
+        } 
+        // catch (\Exception $e) {
+        //     return response()->json([
+        //         'success' => false,
+        //         'message' => $e->getMessage(),
+        //     ], 500);
+        // }
+
+        catch (\Exception $e) {
+
+            $error = $e->getMessage();
+
+            if (
+                str_contains($error, 'Attempt to debit an account') ||
+                str_contains($error, 'Insufficient funds')
+            ) {
+                $message = 'Your wallet does not have enough SOL balance.';
+            } elseif (str_contains($error, 'Blockhash not found')) {
+                $message = 'Transaction expired. Please try again.';
+            } elseif (str_contains($error, 'User rejected')) {
+                $message = 'Transaction cancelled by user.';
+            } else {
+                $message = 'NFT minting failed. Please try again.';
+            }
+
+            \Log::error('Mint Error', [
+                'actual_error' => $error,
+            ]);
+
             return response()->json([
                 'success' => false,
-                'message' => $e->getMessage(),
-            ], 500);
+                'message' => $message,
+            ], 422);
         }
     }
 

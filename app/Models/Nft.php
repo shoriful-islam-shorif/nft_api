@@ -43,6 +43,7 @@ class Nft extends Model
 
         // Status
         'status', 'minted_at','is_listed', 'list_price', 'listed_at',
+        'sold_to', 'sold_at', 'sold_tx', 'previous_owner',
 
         
     ];
