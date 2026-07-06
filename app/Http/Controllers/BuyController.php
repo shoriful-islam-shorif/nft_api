@@ -8,6 +8,8 @@ use Illuminate\Http\Request;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Cache;
 
 class BuyController extends Controller
 {
@@ -131,5 +133,81 @@ class BuyController extends Controller
                 'explorer_url'   => $this->solana->getExplorerUrl($request->transaction_sig, 'tx'),
             ],
         ]);
+    }
+
+    public function spumpPrice(): JsonResponse
+    {
+        try {
+
+            $data = Cache::remember('spump_price_data', 60, function () {
+
+                $spumpMint = env('SPUMP_MINT_ADDRESS');
+                $solMint   = 'So11111111111111111111111111111111111111112';
+
+                $response = Http::timeout(10)->get(
+                    'https://lite-api.jup.ag/price/v3',
+                    [
+                        'ids' => "{$spumpMint},{$solMint}"
+                    ]
+                );
+
+                if (!$response->successful()) {
+                    return null;
+                }
+
+                $prices = $response->json();
+
+                if (
+                    !isset($prices[$spumpMint]['usdPrice']) ||
+                    !isset($prices[$solMint]['usdPrice'])
+                ) {
+                    return null;
+                }
+
+                $spumpUsd = (float) $prices[$spumpMint]['usdPrice'];
+                $solUsd   = (float) $prices[$solMint]['usdPrice'];
+
+                if ($spumpUsd <= 0) {
+                    return null;
+                }
+
+                return [
+                    'spump_per_sol' => round($solUsd / $spumpUsd),
+                    'spump_usd'     => $spumpUsd,
+                    'sol_usd'       => $solUsd,
+                    'decimals'      => (int) ($prices[$spumpMint]['decimals'] ?? 6),
+                    'updated_at'    => now()->toDateTimeString(),
+                ];
+            });
+
+            if (!$data) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Unable to fetch SPUMP price.'
+                ], 500);
+            }
+
+            return response()->json([
+                'success' => true,
+                'spump_per_sol' => $data['spump_per_sol'],
+                'spump_usd' => $data['spump_usd'],
+                'sol_usd' => $data['sol_usd'],
+                'decimals' => $data['decimals'],
+                'updated_at' => $data['updated_at'],
+            ]);
+
+        } catch (\Throwable $e) {
+
+            Log::error('SPUMP Price Error', [
+                'message' => $e->getMessage(),
+                'line' => $e->getLine(),
+                'file' => $e->getFile(),
+            ]);
+
+            return response()->json([
+                'success' => false,
+                'message' => 'Unable to fetch SPUMP price.'
+            ], 500);
+        }
     }
 }

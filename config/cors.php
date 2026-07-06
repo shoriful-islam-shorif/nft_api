@@ -6,7 +6,7 @@ return [
     'allowed_origins' => [
         'http://localhost:3000',
         'http://localhost:3001',
-        'https://your-production-domain.com', // production domain এখানে দিন
+        'https://your-production-domain.com', // production domain 
     ],
     'allowed_origins_patterns' => [],
     'allowed_headers' => ['*'],

@@ -51,4 +51,15 @@ Route::prefix('marketplace')->group(function () {
 Route::prefix('buy')->group(function () {
     Route::get('/prepare/{nft_id}', [BuyController::class, 'prepare']);
     Route::post('/confirm',         [BuyController::class, 'confirm']);
+    Route::get('/spump-price', [BuyController::class, 'spumpPrice']);
+});
+
+Route::get('/config', function () {
+    return response()->json([
+        'success' => true,
+        'data'    => [
+            'platform_fee_percent' => config('services.platform.fee_percent', 3),
+            'network'              => config('services.solana.network', 'devnet'),
+        ],
+    ]);
 });

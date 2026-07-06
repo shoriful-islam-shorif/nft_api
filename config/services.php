@@ -56,4 +56,9 @@ return [
         'rpc_url' => env('SOLANA_RPC_URL', 'https://api.devnet.solana.com'),
     ],
 
+    'platform' => [
+    'fee_percent' => env('PLATFORM_FEE_PERCENT', 3),
+    'wallet'      => env('PLATFORM_WALLET'),
+    ],
+
 ];
