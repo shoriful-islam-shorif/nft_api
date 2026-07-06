@@ -6,7 +6,10 @@ return [
     'allowed_origins' => [
         'http://localhost:3000',
         'http://localhost:3001',
-        'https://your-production-domain.com', // production domain 
+        'https://nft.bfin.technology',
+        'https://www.nft.bfin.technology',
+        'https://scottypumpkin.com',        // ← আপনার main site
+        'https://www.scottypumpkin.com',    // ← www version
     ],
     'allowed_origins_patterns' => [],
     'allowed_headers' => ['*'],
