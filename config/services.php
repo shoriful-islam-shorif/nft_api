@@ -43,7 +43,7 @@ return [
     'pinata' => [
         'api_key'    => env('PINATA_API_KEY'),
         'secret_key' => env('PINATA_SECRET_API_KEY'),
-        'gateway'    => env('PINATA_GATEWAY', 'https://gateway.pinata.cloud/ipfs/'),
+        'gateway'    => env('PINATA_GATEWAY', 'https://ipfs.io/ipfs/'),
     ],
 
     /*

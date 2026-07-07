@@ -1,14 +1,14 @@
 <?php
 
 return [
-    'paths' => ['api/*'],
+    'paths' => ['api/*','sanctum/csrf-cookie'],
     'allowed_methods' => ['*'],
     'allowed_origins' => [
         'http://localhost:3000',
         'http://localhost:3001',
         'https://nft.bfin.technology',
         'https://www.nft.bfin.technology',
-        'https://scottypumpkin.com',        // ← আপনার main site
+        'https://scottypumpkin.com',        
         'https://www.scottypumpkin.com',    // ← www version
     ],
     'allowed_origins_patterns' => [],

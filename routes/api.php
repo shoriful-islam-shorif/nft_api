@@ -26,8 +26,10 @@ Route::prefix('ipfs')->group(function () {
 
 // Collections
 Route::prefix('collections')->group(function () {
-    Route::get('/',    [CollectionController::class, 'index']);  // list
-    Route::post('/',   [CollectionController::class, 'store']);  // create
+    Route::get('/',    [CollectionController::class, 'index']);     // list
+    Route::post('/',   [CollectionController::class, 'store']);     // create
+    Route::get('/{id}',  [CollectionController::class, 'show']);    // ← single collection + NFTs
+    Route::put('/{id}',  [CollectionController::class, 'update']); //update collection
 });
 
 // NFT
