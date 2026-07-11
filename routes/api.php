@@ -1,5 +1,6 @@
 <?php
 
+use App\Http\Controllers\AdminController;
 use App\Http\Controllers\BuyController;
 use Illuminate\Support\Facades\Route;
 use App\Http\Controllers\NftController;
@@ -65,3 +66,26 @@ Route::get('/config', function () {
         ],
     ]);
 });
+
+// Admin Routes
+Route::prefix('admin')->group(function () {
+
+    // Public — login only
+    Route::post('/login', [AdminController::class, 'login']);
+
+    // Protected — Sanctum token 
+    Route::middleware(['auth:sanctum'])->group(function () {
+        Route::post('/logout',               [AdminController::class, 'logout']);
+        Route::get('/stats',                 [AdminController::class, 'stats']);
+        Route::get('/nfts',                  [AdminController::class, 'nfts']);
+        Route::get('/nfts/pending',          [AdminController::class, 'pendingNfts']);
+        Route::post('/nfts/{id}/approve',    [AdminController::class, 'approveNft']);
+        Route::post('/nfts/{id}/reject',     [AdminController::class, 'rejectNft']);
+        Route::post('/nfts/{id}/unlist',     [AdminController::class, 'unlistNft']);
+        Route::delete('/nfts/{id}',          [AdminController::class, 'deleteNft']);
+        Route::get('/sales',                 [AdminController::class, 'sales']);
+        Route::get('/users',                 [AdminController::class, 'users']);
+    });
+});
+
+

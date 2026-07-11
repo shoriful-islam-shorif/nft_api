@@ -6,8 +6,8 @@ return [
     'allowed_origins' => [
         'http://localhost:3000',
         'http://localhost:3001',
-        'https://nft.bfin.technology',
-        'https://www.nft.bfin.technology',
+        'https://nft.scottypumpkin.com',
+        'https://www.nft.scottypumpkin.com',
         'https://scottypumpkin.com',        
         'https://www.scottypumpkin.com',    // ← www version
     ],
