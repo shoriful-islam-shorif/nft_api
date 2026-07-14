@@ -22,7 +22,7 @@ class AdminController extends Controller
 
     // ── POST /api/admin/login ────────────────────────────────
     public function login(Request $request): JsonResponse
-    {
+    {   
         $request->validate(['email' => 'required|email', 'password' => 'required']);
 
         if (!Auth::attempt(['email' => $request->email, 'password' => $request->password])) {

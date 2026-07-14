@@ -107,7 +107,7 @@ Route::prefix('admin')->group(function () {
         // Route::post('/nfts/{id}/approve',    [AdminController::class, 'approveNft']);
         Route::post('/nfts/{id}/reject',     [AdminController::class, 'rejectNft']);
         Route::post('/nfts/{id}/unlist',     [AdminController::class, 'unlistNft']);
-        Route::post('//nfts/{id}/list',      [AdminController::class, 'listNft']);
+        Route::post('/nfts/{id}/list',      [AdminController::class, 'listNft']);
         
 
         // Sales
