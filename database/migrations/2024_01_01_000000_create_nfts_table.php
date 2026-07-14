@@ -66,7 +66,7 @@ return new class extends Migration
             $table->string('transaction_sig')->nullable();
 
             // Status
-            $table->enum('status', ['draft', 'pending', 'minted', 'failed'])->default('pending');
+            $table->enum('status', ['draft', 'pending','rejected', 'minted', 'failed'])->default('pending');
             $table->timestamp('minted_at')->nullable();
 
             $table->timestamps();

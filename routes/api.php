@@ -67,24 +67,63 @@ Route::get('/config', function () {
     ]);
 });
 
-// Admin Routes
-Route::prefix('admin')->group(function () {
+// // Admin Routes
+// Route::prefix('admin')->group(function () {
 
-    // Public — login only
+//     // Public — login only
+//     Route::post('/login', [AdminController::class, 'login']);
+
+//     // Protected — Sanctum token 
+//     Route::middleware(['auth:sanctum'])->group(function () {
+//         Route::post('/logout',               [AdminController::class, 'logout']);
+//         Route::get('/stats',                 [AdminController::class, 'stats']);
+//         Route::get('/nfts',                  [AdminController::class, 'nfts']);
+//         Route::get('/nfts/pending',          [AdminController::class, 'pendingNfts']);
+//         Route::post('/nfts/{id}/approve',    [AdminController::class, 'approveNft']);
+//         Route::post('/nfts/{id}/reject',     [AdminController::class, 'rejectNft']);
+//         Route::post('/nfts/{id}/unlist',     [AdminController::class, 'unlistNft']);
+//         Route::delete('/nfts/{id}',          [AdminController::class, 'deleteNft']);
+//         Route::get('/sales',                 [AdminController::class, 'sales']);
+//         Route::get('/users',                 [AdminController::class, 'users']);
+//     });
+// });
+
+// ── Public config (frontend  ────────────────────────
+Route::get('/config', [AdminController::class, 'publicConfig']);
+
+// ── Admin Routes ─────────────────────────────────────────────
+Route::prefix('admin')->group(function () {
     Route::post('/login', [AdminController::class, 'login']);
 
-    // Protected — Sanctum token 
     Route::middleware(['auth:sanctum'])->group(function () {
-        Route::post('/logout',               [AdminController::class, 'logout']);
-        Route::get('/stats',                 [AdminController::class, 'stats']);
+        // Auth
+        Route::post('/logout', [AdminController::class, 'logout']);
+
+        // Dashboard
+        Route::get('/stats', [AdminController::class, 'stats']);
+
+        // NFTs
         Route::get('/nfts',                  [AdminController::class, 'nfts']);
-        Route::get('/nfts/pending',          [AdminController::class, 'pendingNfts']);
-        Route::post('/nfts/{id}/approve',    [AdminController::class, 'approveNft']);
+        // Route::post('/nfts/{id}/approve',    [AdminController::class, 'approveNft']);
         Route::post('/nfts/{id}/reject',     [AdminController::class, 'rejectNft']);
         Route::post('/nfts/{id}/unlist',     [AdminController::class, 'unlistNft']);
-        Route::delete('/nfts/{id}',          [AdminController::class, 'deleteNft']);
-        Route::get('/sales',                 [AdminController::class, 'sales']);
-        Route::get('/users',                 [AdminController::class, 'users']);
+        Route::post('//nfts/{id}/list',      [AdminController::class, 'listNft']);
+        
+
+        // Sales
+        Route::get('/sales', [AdminController::class, 'sales']);
+
+        // Users
+        Route::get('/users', [AdminController::class, 'users']);
+
+        // Collections
+        Route::get('/collections',            [AdminController::class, 'collections']);
+        Route::put('/collections/{id}',       [AdminController::class, 'updateCollection']);
+        Route::delete('/collections/{id}',    [AdminController::class, 'deleteCollection']);
+
+        // Platform Settings
+        Route::get('/settings',  [AdminController::class, 'getSettings']);
+        Route::post('/settings', [AdminController::class, 'updateSettings']);
     });
 });
 
