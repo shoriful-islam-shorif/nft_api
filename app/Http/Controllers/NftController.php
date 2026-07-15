@@ -71,6 +71,7 @@ class NftController extends Controller
         //     'attributes.*.value'      => 'required|string',
         // ]);
 
+
           $validator = \Validator::make($request->all(), [
         'wallet_address'          => 'required|string',
         'name'                    => 'required|string|max:100',
@@ -188,9 +189,11 @@ class NftController extends Controller
                 'buyer_discount_percent' => $request->buyer_discount_percent ?? 0,
                 'buyer_discount_max_uses'=> $request->buyer_discount_max_uses,
                 'royalty'                => $request->royalty ?? 5,
+                'attributes' => $request->input('attributes', []),
                 'network'                => $this->solana->getNetwork(),
                 'network_fee'            => $networkFee,
                 'wallet_address'         => $request->wallet_address,
+                'creator_wallet'  => $request->wallet_address,
                 'status'                 => 'pending',
             ]);
 
@@ -316,6 +319,45 @@ class NftController extends Controller
             }
 
             $nft = Nft::findOrFail($request->nft_id);
+
+            // ── Payment Verification ─────────────────────────────
+            // Confirming the signature landed on-chain is NOT enough —
+            // it proves *a* transaction happened, not that this one
+            // actually paid the mint price to the platform. Check the
+            // treasury wallet's balance actually increased by the
+            // expected amount inside this exact transaction.
+            if (!$nft->is_free_listing && (float) $nft->price_after_discount > 0) {
+                $treasuryWallet = config('services.platform.wallet');
+
+                if (!$treasuryWallet) {
+                    \Log::error('Mint confirm blocked: platform wallet not configured');
+                    return response()->json([
+                        'success' => false,
+                        'message' => 'Platform wallet is not configured. Please contact support.',
+                    ], 500);
+                }
+
+                $paid = $this->solana->verifyPayment(
+                    $request->transaction_sig,
+                    $treasuryWallet,
+                    (float) $nft->price_after_discount
+                );
+
+                if (!$paid) {
+                    \Log::warning('Mint confirm blocked: payment not found in transaction', [
+                        'nft_id'          => $nft->id,
+                        'transaction_sig' => $request->transaction_sig,
+                        'expected_amount' => $nft->price_after_discount,
+                        'treasury_wallet' => $treasuryWallet,
+                    ]);
+
+                    return response()->json([
+                        'success' => false,
+                        'message' => 'Payment not found in this transaction. Expected ' . $nft->price_after_discount . ' SOL to the platform wallet.',
+                    ], 422);
+                }
+            }
+
             $nft->update([
                 'mint_address'    => $request->mint_address,
                 'transaction_sig' => $request->transaction_sig,

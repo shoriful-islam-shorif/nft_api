@@ -36,10 +36,10 @@ class Nft extends Model
         'has_buyer_discount', 'buyer_discount_percent', 'buyer_discount_max_uses',
 
         // Royalty & Network
-        'royalty', 'network', 'network_fee',
+        'royalty', 'network', 'network_fee','attributes',
 
         // Blockchain
-        'wallet_address', 'mint_address', 'transaction_sig',
+        'wallet_address', 'mint_address', 'transaction_sig','creator_wallet',
 
         // Status
         'status', 'minted_at','is_listed', 'list_price', 'listed_at',
@@ -58,7 +58,10 @@ class Nft extends Model
         'network_fee'        => 'float',
         'is_listed'  => 'boolean',
         'list_price' => 'float',
-        'listed_at'  => 'datetime'
+        'sold_price' => 'float',
+        'listed_at'  => 'datetime',
+        'attributes' => 'array',
+
     ];
 
     // Collection relation

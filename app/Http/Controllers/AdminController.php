@@ -57,7 +57,7 @@ class AdminController extends Controller
     {
         if ($err = $this->checkAdmin($request)) return $err;
 
-        $totalVolume  = Nft::whereNotNull('sold_to')->sum('list_price');
+        $totalVolume  = Nft::whereNotNull('sold_to')->sum('sold_price');
 
         return response()->json([
             'success' => true,
@@ -71,7 +71,7 @@ class AdminController extends Controller
                 'total_revenue'  => round($totalVolume * (PlatformSetting::get('platform_fee_percent', 3) / 100), 6),
                 'total_collections' => Collection::count(),
                 'recent_sales'   => Nft::whereNotNull('sold_to')->orderBy('sold_at', 'desc')->limit(5)
-                    ->get(['id', 'name', 'image_url', 'list_price', 'wallet_address', 'sold_to', 'sold_at']),
+                    ->get(['id', 'name', 'image_url', 'sold_price', 'wallet_address', 'sold_to', 'sold_at']),
                 'category_stats' => Nft::where('status', 'minted')
                     ->selectRaw('category, COUNT(*) as total')
                     ->groupBy('category')->orderByDesc('total')->get(),
@@ -150,7 +150,7 @@ class AdminController extends Controller
         if ($request->from) $query->whereDate('sold_at', '>=', $request->from);
         if ($request->to)   $query->whereDate('sold_at', '<=', $request->to);
 
-        $totalVolume = Nft::whereNotNull('sold_to')->sum('list_price');
+        $totalVolume = Nft::whereNotNull('sold_to')->sum('sold_price');
 
         return response()->json([
             'success' => true,
@@ -241,7 +241,7 @@ class AdminController extends Controller
         return response()->json(['success' => true, 'message' => 'Settings saved successfully!']);
     }
 
-    // GET /api/config (public — frontend এর জন্য)
+    // GET /api/config (public — frontend )
     public function publicConfig(): JsonResponse
     {
         return response()->json([

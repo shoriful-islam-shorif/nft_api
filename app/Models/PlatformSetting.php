@@ -8,7 +8,7 @@ class PlatformSetting extends Model
 {
     protected $fillable = ['key', 'value', 'type', 'label'];
 
-    // ── Static helper — key দিয়ে value নাও ──────────────────
+    // ── Static helper — key  ──────────────────
     public static function get(string $key, mixed $default = null): mixed
     {
         $setting = static::where('key', $key)->first();
@@ -21,7 +21,7 @@ class PlatformSetting extends Model
         };
     }
 
-    // ── Static helper — key দিয়ে value set করো ──────────────
+    // ── Static helper — key ──────────────
     public static function set(string $key, mixed $value): void
     {
         static::updateOrCreate(

@@ -135,6 +135,152 @@ class SolanaService
     }
 
     /**
+     * Verify that a confirmed transaction actually paid the expected
+     * SOL amount to the expected recipient wallet.
+     *
+     * Without this check, `getTransaction`/`isSignatureConfirmed` only
+     * prove *some* transaction landed on-chain — not that it paid
+     * anything. A client could submit an unrelated (but valid) signed
+     * signature and have the mint marked as paid for free. This reads
+     * the transaction's pre/post SOL balances for the recipient
+     * account and confirms it actually increased by the expected
+     * amount (within a small tolerance for float rounding).
+     */
+    public function verifyPayment(string $signature, string $recipientWallet, float $expectedAmountSol, float $toleranceSol = 0.0005): bool
+    {
+        // Nothing to verify for free mints.
+        if ($expectedAmountSol <= 0) {
+            return true;
+        }
+
+        $tx = $this->getTransaction($signature);
+        if (!$tx) {
+            return false;
+        }
+
+        // Transaction must not have failed on-chain.
+        if (($tx['meta']['err'] ?? null) !== null) {
+            return false;
+        }
+
+        $accountKeys   = $tx['transaction']['message']['accountKeys'] ?? [];
+        $preBalances   = $tx['meta']['preBalances'] ?? [];
+        $postBalances  = $tx['meta']['postBalances'] ?? [];
+
+        if (empty($accountKeys) || empty($preBalances) || empty($postBalances)) {
+            return false;
+        }
+
+        foreach ($accountKeys as $index => $key) {
+            $pubkey = is_array($key) ? ($key['pubkey'] ?? null) : $key;
+            if ($pubkey !== $recipientWallet) {
+                continue;
+            }
+
+            $pre  = $preBalances[$index]  ?? null;
+            $post = $postBalances[$index] ?? null;
+            if ($pre === null || $post === null) {
+                return false;
+            }
+
+            $receivedSol = ($post - $pre) / 1_000_000_000;
+            return $receivedSol >= ($expectedAmountSol - $toleranceSol);
+        }
+
+        // Recipient wallet never appears in the transaction's account keys.
+        return false;
+    }
+
+    /**
+     * Resolve the platform treasury wallet. The admin dashboard lets an
+     * admin override this via `platform_settings` (key: platform_wallet);
+     * fall back to the .env default when no override is set. Every place
+     * that needs "the" platform wallet (mint payment verification, buy
+     * payment verification, showing it to the frontend) must go through
+     * this single method — otherwise different parts of the app can end
+     * up checking payments against different addresses.
+     */
+    public function getTreasuryWallet(): ?string
+    {
+        $dbWallet = \App\Models\PlatformSetting::get('platform_wallet');
+        return $dbWallet ?: config('services.platform.wallet');
+    }
+
+    /**
+     * Resolve the platform fee percent the same way — DB setting
+     * (admin-editable) overrides the .env default.
+     */
+    public function getPlatformFeePercent(): float
+    {
+        return (float) \App\Models\PlatformSetting::get(
+            'platform_fee_percent',
+            config('services.platform.fee_percent', 3)
+        );
+    }
+
+    /**
+     * Verify an SPL-token transfer (e.g. SPUMP payments) actually
+     * landed on the recipient's associated token account inside this
+     * exact transaction — the token-balance equivalent of
+     * verifyPayment(). Reads meta.preTokenBalances/postTokenBalances,
+     * which report ui-amounts per (mint, owner) pair regardless of
+     * whether the destination token account already existed before
+     * this transaction (newly-created ATAs simply have no pre-balance
+     * entry, treated as a starting balance of 0).
+     */
+    public function verifyTokenPayment(string $signature, string $mintAddress, string $recipientWallet, float $expectedAmount, float $tolerance = 0.01): bool
+    {
+        if ($expectedAmount <= 0) {
+            return true;
+        }
+
+        $tx = $this->getTransaction($signature);
+        if (!$tx) {
+            return false;
+        }
+
+        if (($tx['meta']['err'] ?? null) !== null) {
+            return false;
+        }
+
+        $preTokenBalances  = $tx['meta']['preTokenBalances']  ?? [];
+        $postTokenBalances = $tx['meta']['postTokenBalances'] ?? [];
+
+        $postEntry = null;
+        foreach ($postTokenBalances as $entry) {
+            if (($entry['mint'] ?? null) === $mintAddress && ($entry['owner'] ?? null) === $recipientWallet) {
+                $postEntry = $entry;
+                break;
+            }
+        }
+
+        if (!$postEntry) {
+            // Recipient's token account never appears post-transaction
+            // for this mint — no way it received a payment.
+            return false;
+        }
+
+        $decimals = (int) ($postEntry['uiTokenAmount']['decimals'] ?? 0);
+        $postRaw  = (float) ($postEntry['uiTokenAmount']['amount'] ?? '0');
+
+        $preRaw = 0.0;
+        foreach ($preTokenBalances as $entry) {
+            if (
+                ($entry['mint'] ?? null) === $mintAddress
+                && ($entry['owner'] ?? null) === $recipientWallet
+                && ($entry['accountIndex'] ?? null) === ($postEntry['accountIndex'] ?? null)
+            ) {
+                $preRaw = (float) ($entry['uiTokenAmount']['amount'] ?? '0');
+                break;
+            }
+        }
+
+        $received = ($postRaw - $preRaw) / (10 ** $decimals);
+
+        return $received >= ($expectedAmount - $tolerance);
+    }
+
+    /**
      * Network info
      */
     public function getNetwork(): string
