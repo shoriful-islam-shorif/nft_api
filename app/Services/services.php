@@ -52,27 +52,27 @@ return [
     |--------------------------------------------------------------------------
     */
     'solana' => [
-        'network' => env('SOLANA_NETWORK', 'devnet'),
-        'rpc_url' => env('SOLANA_RPC_URL', 'https://api.devnet.solana.com'),
+        'network'     => env('SOLANA_NETWORK', 'devnet'),
+        'rpc_url'     => env('SOLANA_RPC_URL', 'https://api.devnet.solana.com'),
         'node_binary' => env('NODE_BINARY_PATH', 'node'),
     ],
 
     'platform' => [
-    'fee_percent' => env('PLATFORM_FEE_PERCENT', 3),
-    'wallet'      => env('PLATFORM_WALLET'),
-    'delegate_wallet'        => env('PLATFORM_DELEGATE_WALLET'),
-    'delegate_keypair_path'  => env('PLATFORM_DELEGATE_KEYPAIR_PATH'),
+        'fee_percent'            => env('PLATFORM_FEE_PERCENT', 3),
+        'wallet'                 => env('PLATFORM_WALLET'),
+        // Separate hot wallet used ONLY as the mpl-core TransferDelegate
+        // authority for marketplace sales — deliberately not the same
+        // key as the fee-receiving treasury wallet above, so a
+        // compromise of one doesn't automatically compromise the other.
+        'delegate_wallet'        => env('PLATFORM_DELEGATE_WALLET'),
+        'delegate_keypair_path'  => env('PLATFORM_DELEGATE_KEYPAIR_PATH'),
     ],
 
-    // The two accepted SPL-token payment currencies across the platform
-    // (mint, list, buy) — SPUMP is the primary/reference currency; USDC
-    // is the alternative. SOL is not a payment currency anywhere except
-    // the network/gas fee, which is always paid in SOL regardless (a
-    // Solana protocol requirement).
-    //
-    // IMPORTANT: SPUMP_MINT_ADDRESS must be set in .env or every
-    // SPUMP/USDC rate lookup (mint pricing, purchase pricing) will fail
-    // silently and the frontend will show "Loading rate..." forever.
+    // The two accepted SPL-token payment currencies across the
+    // platform (mint, list, buy) — SPUMP is the primary/reference
+    // currency; USDC is the alternative. SOL is not accepted as a
+    // payment currency anywhere except the network/gas fee, which is
+    // always paid in SOL regardless (a Solana protocol requirement).
     'tokens' => [
         'spump_mint' => env('SPUMP_MINT_ADDRESS'),
         'usdc_mint'  => env('USDC_MINT_ADDRESS', '4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU'), // devnet USDC default

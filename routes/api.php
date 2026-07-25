@@ -38,7 +38,10 @@ Route::prefix('nft')->group(function () {
     Route::post('/create',        [NftController::class, 'create']);
     Route::post('/mint',          [NftController::class, 'mint']);
     Route::post('/calculate',     [NftController::class, 'calculate']);
+    Route::post('/import/preview', [NftController::class, 'importPreview']);
+    Route::post('/import',        [NftController::class, 'import']);
     Route::get('/list/{wallet}',  [NftController::class, 'listByWallet']);
+    Route::get('/edition/{edition_group_id}/supply', [NftController::class, 'editionSupply']);
     Route::get('/{mint_address}', [NftController::class, 'show']);
 });
 
@@ -48,6 +51,7 @@ Route::prefix('marketplace')->group(function () {
     Route::post('/list',            [MarketplaceController::class, 'list']);
     Route::post('/unlist',          [MarketplaceController::class, 'unlist']);
     Route::get('/my-nfts/{wallet}', [MarketplaceController::class, 'myNfts']);
+    Route::get('/edition/{edition_group_id}/listings', [MarketplaceController::class, 'editionListings']);
 });
 
 // Buy
@@ -57,36 +61,9 @@ Route::prefix('buy')->group(function () {
     Route::get('/spump-price', [BuyController::class, 'spumpPrice']);
 });
 
-Route::get('/config', function () {
-    return response()->json([
-        'success' => true,
-        'data'    => [
-            'platform_fee_percent' => config('services.platform.fee_percent', 3),
-            'network'              => config('services.solana.network', 'devnet'),
-        ],
-    ]);
-});
 
-// // Admin Routes
-// Route::prefix('admin')->group(function () {
+Route::get('/image/{id}', [MarketplaceController::class, 'show']);
 
-//     // Public — login only
-//     Route::post('/login', [AdminController::class, 'login']);
-
-//     // Protected — Sanctum token 
-//     Route::middleware(['auth:sanctum'])->group(function () {
-//         Route::post('/logout',               [AdminController::class, 'logout']);
-//         Route::get('/stats',                 [AdminController::class, 'stats']);
-//         Route::get('/nfts',                  [AdminController::class, 'nfts']);
-//         Route::get('/nfts/pending',          [AdminController::class, 'pendingNfts']);
-//         Route::post('/nfts/{id}/approve',    [AdminController::class, 'approveNft']);
-//         Route::post('/nfts/{id}/reject',     [AdminController::class, 'rejectNft']);
-//         Route::post('/nfts/{id}/unlist',     [AdminController::class, 'unlistNft']);
-//         Route::delete('/nfts/{id}',          [AdminController::class, 'deleteNft']);
-//         Route::get('/sales',                 [AdminController::class, 'sales']);
-//         Route::get('/users',                 [AdminController::class, 'users']);
-//     });
-// });
 
 // ── Public config (frontend  ────────────────────────
 Route::get('/config', [AdminController::class, 'publicConfig']);
@@ -118,6 +95,7 @@ Route::prefix('admin')->group(function () {
 
         // Collections
         Route::get('/collections',            [AdminController::class, 'collections']);
+        Route::post('/collections',           [AdminController::class, 'createCollection']);
         Route::put('/collections/{id}',       [AdminController::class, 'updateCollection']);
         Route::delete('/collections/{id}',    [AdminController::class, 'deleteCollection']);
 

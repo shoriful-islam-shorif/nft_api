@@ -6,12 +6,41 @@ use App\Models\Collection;
 use App\Models\Nft;
 use App\Models\PlatformSetting;
 use App\Models\User;
+use App\Services\SolanaService;
 use Illuminate\Http\Request;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Support\Facades\Auth;
 
 class AdminController extends Controller
 {
+    private SolanaService $solana;
+
+    public function __construct(SolanaService $solana)
+    {
+        $this->solana = $solana;
+    }
+
+    /**
+     * sold_price is denominated in whatever list_currency was active
+     * at sale time (list_currency itself is never cleared on sale).
+     * Summing it across SPUMP and USDC rows would silently produce a
+     * meaningless number, so volume/revenue are always grouped by
+     * currency first — same fix as CollectionController.
+     * Returns e.g. ['spump' => 45000, 'usdc' => 120].
+     */
+    private function volumeByCurrency($nfts): array
+    {
+        return $nfts
+            ->groupBy(fn($n) => $n->list_currency ?: 'spump')
+            ->map(fn($group) => (float) $group->sum('sold_price'))
+            ->toArray();
+    }
+
+    private function revenueByCurrency(array $volumeByCurrency, float $feePercent): array
+    {
+        return array_map(fn($vol) => round($vol * ($feePercent / 100), 6), $volumeByCurrency);
+    }
+
     private function checkAdmin(Request $request): ?JsonResponse
     {
         if (!$request->user() || !$request->user()->is_admin) {
@@ -57,7 +86,10 @@ class AdminController extends Controller
     {
         if ($err = $this->checkAdmin($request)) return $err;
 
-        $totalVolume  = Nft::whereNotNull('sold_to')->sum('sold_price');
+        $soldNfts    = Nft::whereNotNull('sold_to')->get(['list_currency', 'sold_price']);
+        $feePercent  = (float) PlatformSetting::get('platform_fee_percent', 3);
+        $volumes     = $this->volumeByCurrency($soldNfts);
+        $revenues    = $this->revenueByCurrency($volumes, $feePercent);
 
         return response()->json([
             'success' => true,
@@ -67,11 +99,11 @@ class AdminController extends Controller
                 'pending_nfts'   => Nft::where('status', 'pending')->count(),
                 'listed_nfts'    => Nft::where('is_listed', true)->count(),
                 'sold_nfts'      => Nft::whereNotNull('sold_to')->count(),
-                'total_volume'   => round($totalVolume, 6),
-                'total_revenue'  => round($totalVolume * (PlatformSetting::get('platform_fee_percent', 3) / 100), 6),
+                'total_volume'   => $volumes,
+                'total_revenue'  => $revenues,
                 'total_collections' => Collection::count(),
                 'recent_sales'   => Nft::whereNotNull('sold_to')->orderBy('sold_at', 'desc')->limit(5)
-                    ->get(['id', 'name', 'image_url', 'sold_price', 'wallet_address', 'sold_to', 'sold_at']),
+                    ->get(['id', 'name', 'image_url', 'sold_price', 'list_currency', 'wallet_address', 'sold_to', 'sold_at']),
                 'category_stats' => Nft::where('status', 'minted')
                     ->selectRaw('category, COUNT(*) as total')
                     ->groupBy('category')->orderByDesc('total')->get(),
@@ -96,9 +128,17 @@ class AdminController extends Controller
     public function approveNft(Request $request, int $id): JsonResponse
     {
         if ($err = $this->checkAdmin($request)) return $err;
-        $nft = Nft::findOrFail($id);
-        $nft->update(['status' => 'minted', 'minted_at' => now()]);
-        return response()->json(['success' => true, 'message' => 'NFT approved.', 'data' => $nft->fresh()]);
+
+        // Deliberately not implemented as a force-approve. A "pending" NFT
+        // has no mint_address yet — it's only set to "minted" once the real
+        // on-chain mint transaction actually confirms (see NftController::
+        // mint / POST /nft/mint). Flipping status here without that would
+        // create a phantom "minted" record with no on-chain asset behind
+        // it, breaking listing/marketplace/purchase for it later.
+        return response()->json([
+            'success' => false,
+            'message' => 'NFTs can only become "minted" by confirming the real on-chain mint transaction — admin cannot force this.',
+        ], 422);
     }
 
     public function rejectNft(Request $request, int $id): JsonResponse
@@ -121,17 +161,21 @@ class AdminController extends Controller
             return $err;
         }
 
-        $nft = Nft::findOrFail($id);
-
-        $nft->update([
-            'is_listed' => true,
-            'listed_at' => now(),
-        ]);
-
+        // Deliberately not implemented as a force-list. Listing an NFT for
+        // sale requires the seller's own wallet to sign an on-chain
+        // TransferDelegate approval (see the marketplace page's
+        // grantTransferDelegate() + POST /marketplace/list) — that's what
+        // actually gives the platform permission to move the asset later.
+        // Admin holds no signing key for the seller's wallet, so flipping
+        // `is_listed` here alone would produce a listing that LOOKS buyable
+        // but always fails at purchase time with the mpl-core program
+        // rejecting the transfer ("custom program error: 0x1a" / NoApprovals),
+        // because the platform was never actually granted transfer authority
+        // on-chain for that asset.
         return response()->json([
-            'success' => true,
-            'message' => 'NFT listed successfully.',
-        ]);
+            'success' => false,
+            'message' => 'NFTs can only be listed by their owner from the Marketplace page — this grants the platform on-chain transfer permission, which admin cannot do on the owner\'s behalf.',
+        ], 422);
     }
 
     public function deleteNft(Request $request, int $id): JsonResponse
@@ -150,15 +194,18 @@ class AdminController extends Controller
         if ($request->from) $query->whereDate('sold_at', '>=', $request->from);
         if ($request->to)   $query->whereDate('sold_at', '<=', $request->to);
 
-        $totalVolume = Nft::whereNotNull('sold_to')->sum('sold_price');
+        $soldNfts   = Nft::whereNotNull('sold_to')->get(['list_currency', 'sold_price']);
+        $feePercent = (float) PlatformSetting::get('platform_fee_percent', 3);
+        $volumes    = $this->volumeByCurrency($soldNfts);
+        $revenues   = $this->revenueByCurrency($volumes, $feePercent);
 
         return response()->json([
             'success' => true,
             'data'    => $query->paginate(20),
             'summary' => [
                 'total_sales'   => Nft::whereNotNull('sold_to')->count(),
-                'total_volume'  => round($totalVolume, 6),
-                'total_revenue' => round($totalVolume * (PlatformSetting::get('platform_fee_percent', 3) / 100), 6),
+                'total_volume'  => $volumes,
+                'total_revenue' => $revenues,
             ],
         ]);
     }
@@ -190,6 +237,30 @@ class AdminController extends Controller
         if ($request->search) $query->where('name', 'like', '%'.$request->search.'%');
 
         return response()->json(['success' => true, 'data' => $query->paginate(20)]);
+    }
+
+    // POST /api/admin/collections
+    public function createCollection(Request $request): JsonResponse
+    {
+        if ($err = $this->checkAdmin($request)) return $err;
+
+        $request->validate([
+            'name'        => 'required|string|max:100',
+            'description' => 'nullable|string|max:500',
+            'symbol'      => 'nullable|string|max:10',
+        ]);
+
+        $collection = Collection::create([
+            'name'           => $request->name,
+            'description'    => $request->description,
+            'symbol'         => $request->symbol,
+            // Admin-created collections aren't tied to a single
+            // creator wallet the way the old creator-facing endpoint
+            // was — the platform itself owns them.
+            'wallet_address' => $request->input('wallet_address', 'admin'),
+        ]);
+
+        return response()->json(['success' => true, 'message' => 'Collection created.', 'data' => $collection]);
     }
 
     // DELETE /api/admin/collections/{id}
@@ -244,15 +315,34 @@ class AdminController extends Controller
     // GET /api/config (public — frontend )
     public function publicConfig(): JsonResponse
     {
+        $isFreeListing       = PlatformSetting::get('is_free_listing', true);
+        // mint_price is now the SPUMP-denominated canonical price (admin
+        // sets this directly in SPUMP) — there is no SOL mint price
+        // anymore. USDC is derived live from the Jupiter SPUMP/USDC rate,
+        // same source BuyController uses for purchase pricing.
+        $mintPriceSpump      = (float) PlatformSetting::get('mint_price', 5000);
+        $mintDiscountPercent = (float) PlatformSetting::get('mint_discount_percent', 15);
+
+        $discountAmount     = $isFreeListing ? 0 : round($mintPriceSpump * ($mintDiscountPercent / 100), 6);
+        $priceAfterDiscount = $isFreeListing ? 0 : round($mintPriceSpump - $discountAmount, 6);
+
+        $rate = $this->solana->getSpumpUsdcRate();
+
         return response()->json([
             'success' => true,
             'data'    => [
                 'platform_fee_percent'  => PlatformSetting::get('platform_fee_percent', 3),
-                'is_free_listing'       => PlatformSetting::get('is_free_listing', true),
-                'mint_discount_percent' => PlatformSetting::get('mint_discount_percent', 15),
+                'is_free_listing'       => $isFreeListing,
+                'mint_price_spump'      => $mintPriceSpump,
+                'mint_discount_percent' => $mintDiscountPercent,
+                'discount_amount'       => $discountAmount,
+                'price_after_discount'  => $priceAfterDiscount,
                 'buyer_discount_percent'=> PlatformSetting::get('buyer_discount_percent', 10),
-                'spump_per_sol'         => PlatformSetting::get('spump_per_sol', 10000),
-                'platform_wallet'       => PlatformSetting::get('platform_wallet', ''),
+                'spump_per_usdc'        => $rate['spump_per_usdc'] ?? null,
+                'spump_mint'            => config('services.tokens.spump_mint'),
+                'usdc_mint'             => config('services.tokens.usdc_mint'),
+                'platform_wallet'       => PlatformSetting::get('platform_wallet', '') ?: config('services.platform.wallet', ''),
+                'delegate_wallet'       => PlatformSetting::get('delegate_wallet', '') ?: config('services.platform.delegate_wallet', ''),
                 'network'               => config('services.solana.network', 'devnet'),
             ],
         ]);

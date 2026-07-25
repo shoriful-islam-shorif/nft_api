@@ -4,6 +4,7 @@ namespace App\Http\Controllers;
 
 use App\Models\Nft;
 use App\Services\SolanaService;
+use App\Services\SolanaSignerService;
 use Illuminate\Http\Request;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Support\Facades\Log;
@@ -14,10 +15,12 @@ use Illuminate\Support\Facades\Cache;
 class BuyController extends Controller
 {
     private SolanaService $solana;
+    private SolanaSignerService $signer;
 
-    public function __construct(SolanaService $solana)
+    public function __construct(SolanaService $solana, SolanaSignerService $signer)
     {
         $this->solana = $solana;
+        $this->signer = $signer;
     }
 
     /**
@@ -73,6 +76,7 @@ class BuyController extends Controller
 
         return [
             'list_price'             => $listPrice,
+            'list_currency'          => $nft->list_currency ?: 'spump',
             'is_discount_eligible'   => $isDiscountEligible,
             'buyer_discount_percent' => $buyerDiscountPercent,
             'buyer_discount_amount'  => $buyerDiscountAmount,
@@ -116,6 +120,7 @@ class BuyController extends Controller
                 'image_url'    => $nft->image_url,
                 'mint_address' => $nft->mint_address,
                 'platform_wallet' => $this->solana->getTreasuryWallet(),
+                'delegate_wallet' => $this->solana->getDelegateWallet(),
                 // Back-compat aliases for existing frontend fields
                 'platform_fee_pct' => $pricing['platform_fee_percent'],
             ]),
@@ -131,8 +136,8 @@ class BuyController extends Controller
         $request->validate([
             'nft_id'           => 'required|exists:nfts,id',
             'buyer_wallet'     => 'required|string',
-            'transaction_sig'  => 'required|string',
-            'payment_method'   => 'nullable|string|in:sol,spump',
+            'signed_tx'        => 'required|string',
+            'payment_currency' => 'nullable|string|in:spump,usdc',
         ]);
 
         $nft = Nft::findOrFail($request->nft_id);
@@ -148,147 +153,186 @@ class BuyController extends Controller
         }
 
         Log::info('Buy confirm request', [
-            'nft_id'          => $request->nft_id,
-            'buyer_wallet'    => $request->buyer_wallet,
-            'transaction_sig' => $request->transaction_sig,
+            'nft_id'       => $request->nft_id,
+            'buyer_wallet' => $request->buyer_wallet,
         ]);
 
-        // Transaction verify 
-        $transaction = $this->solana->getTransaction($request->transaction_sig);
-        $verified    = $transaction !== null
-            || $this->solana->isSignatureConfirmed($request->transaction_sig);
+        // ── Co-sign + broadcast ──────────────────────────────
+        // The buyer has already signed this transaction (payment
+        // instructions + the mpl-core NFT-transfer instruction, which
+        // names the platform as delegate authority). We add the
+        // platform's signature and submit it ourselves — this is what
+        // actually moves NFT ownership on-chain, not just a DB update.
+        $submission = $this->signer->coSignAndSubmit($request->signed_tx);
 
-        if (!$verified) {
+        if (!($submission['success'] ?? false)) {
             return response()->json([
                 'success' => false,
-                'message' => 'Payment transaction not confirmed yet. Please wait a moment and try again.',
+                'message' => $submission['error'] ?? 'Transaction failed to submit. The NFT was not transferred and you were not charged.',
             ], 422);
         }
 
-        // ── Payment Verification ─────────────────────────────
-        // As with minting, a confirmed signature only proves *some*
-        // transaction landed — not that the seller, creator, and
-        // platform were actually paid the correct amounts. Recompute
-        // the exact same discount → fee → royalty breakdown the
-        // frontend used, then check each transfer really happened.
-        $paymentMethod = $request->input('payment_method', 'sol');
-        $pricing       = $this->calculatePricing($nft);
-        $treasuryWallet = $this->solana->getTreasuryWallet();
+        $signature = $submission['signature'];
 
-        if ($paymentMethod === 'sol') {
-            $sellerPaid = $this->solana->verifyPayment(
-                $request->transaction_sig, $pricing['seller_wallet'], $pricing['seller_receives']
+        // ── Race-condition fix: "first N buyers" discount ────────────
+        // calculatePricing() decides eligibility by COUNTING already-sold
+        // NFTs in this collection. Without a lock, two buyers confirming
+        // at nearly the same moment can both read the same "buyersSoFar"
+        // value, both get judged eligible, and both then write sold_to —
+        // letting more than buyer_discount_max_uses people get the
+        // discount. A per-collection lock forces confirm() calls for the
+        // same collection to run one-at-a-time for this section, so the
+        // count each buyer sees is always up to date with any sale that
+        // already committed. Items with no collection have nothing to
+        // race over (their own sold_to state is checked via is_listed
+        // above), so no lock is needed for those.
+        $discountLock = $nft->collection_id
+            ? Cache::lock("buy-confirm:collection:{$nft->collection_id}", 20)
+            : null;
+
+        try {
+            if ($discountLock) {
+                try {
+                    $discountLock->block(10);
+                } catch (\Illuminate\Contracts\Cache\LockTimeoutException $e) {
+                    Log::warning('Buy confirm blocked: could not acquire discount lock in time', [
+                        'nft_id'        => $nft->id,
+                        'collection_id' => $nft->collection_id,
+                    ]);
+                    return response()->json([
+                        'success' => false,
+                        'message' => 'This item is in high demand right now — please try confirming again in a few seconds.',
+                    ], 429);
+                }
+            }
+
+            // ── Payment Verification ─────────────────────────────
+            // Broadcasting successfully only proves the transaction (which
+            // includes both the payment AND the NFT transfer instruction)
+            // executed — but recompute the exact same discount → fee →
+            // royalty breakdown the frontend used and double-check each
+            // transfer amount, as defense in depth.
+            //
+            // list_price (and everything calculatePricing() derives from
+            // it) is denominated in whatever currency the seller listed
+            // in (list_currency: spump or usdc). The buyer can pay in
+            // either — if it matches list_currency, verify those exact
+            // amounts directly; if it differs, convert via the live
+            // SPUMP/USDC rate first (with a tolerance band for rate drift
+            // between the buyer's quote and this confirmation). Both are
+            // SPL tokens, so verification always goes through
+            // verifyTokenPayment() — there's no native-SOL payment path.
+            //
+            // Recomputed *inside* the lock so buyersSoFar reflects any
+            // sale that just committed a moment ago in another request.
+            $pricing         = $this->calculatePricing($nft);
+            $treasuryWallet  = $this->solana->getTreasuryWallet();
+            $listCurrency    = $pricing['list_currency'];
+            $paymentCurrency = $request->input('payment_currency', $listCurrency);
+
+            $sellerAmount   = $pricing['seller_receives'];
+            $platformAmount = $pricing['platform_fee'];
+            $royaltyAmount  = $pricing['royalty_amount'];
+            $tolerance      = 0.0005;
+
+            if ($paymentCurrency !== $listCurrency) {
+                $rateData = $this->getSpumpRateData();
+                if (!$rateData) {
+                    Log::error('Buy confirm blocked: SPUMP/USDC rate unavailable for currency conversion', ['nft_id' => $nft->id]);
+                    return response()->json([
+                        'success' => false,
+                        'message' => 'Unable to verify payment right now (rate unavailable). Please try again shortly.',
+                    ], 422);
+                }
+                $spumpPerUsdc = (float) $rateData['spump_per_usdc'];
+
+                if ($listCurrency === 'usdc' && $paymentCurrency === 'spump') {
+                    // Listed in USDC, buyer pays in SPUMP.
+                    $sellerAmount   = $sellerAmount   * $spumpPerUsdc;
+                    $platformAmount = $platformAmount * $spumpPerUsdc;
+                    $royaltyAmount  = $royaltyAmount  * $spumpPerUsdc;
+                } elseif ($listCurrency === 'spump' && $paymentCurrency === 'usdc') {
+                    // Listed in SPUMP, buyer pays in USDC.
+                    $sellerAmount   = $sellerAmount   / $spumpPerUsdc;
+                    $platformAmount = $platformAmount / $spumpPerUsdc;
+                    $royaltyAmount  = $royaltyAmount  / $spumpPerUsdc;
+                }
+
+                // 5% covers normal rate volatility between quote and confirm.
+                $tolerance = max($sellerAmount * 0.05, $tolerance);
+            }
+
+            $mintAddress = $paymentCurrency === 'usdc'
+                ? config('services.tokens.usdc_mint')
+                : config('services.tokens.spump_mint');
+
+            if (!$mintAddress) {
+                Log::error('Buy confirm blocked: payment token mint not configured', ['currency' => $paymentCurrency]);
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Platform payment is not configured. Please contact support.',
+                ], 500);
+            }
+
+            $sellerPaid = $this->solana->verifyTokenPayment(
+                $signature, $mintAddress, $pricing['seller_wallet'], $sellerAmount, $tolerance
             );
-
-            $platformPaid = $pricing['platform_fee'] <= 0 || (
-                $treasuryWallet && $this->solana->verifyPayment(
-                    $request->transaction_sig, $treasuryWallet, $pricing['platform_fee']
+            $platformPaid = $platformAmount <= 0 || (
+                $treasuryWallet && $this->solana->verifyTokenPayment(
+                    $signature, $mintAddress, $treasuryWallet, $platformAmount, $tolerance
                 )
             );
-
-            $royaltyPaid = $pricing['royalty_amount'] <= 0 || (
-                $pricing['creator_wallet'] && $this->solana->verifyPayment(
-                    $request->transaction_sig, $pricing['creator_wallet'], $pricing['royalty_amount']
+            $royaltyPaid = $royaltyAmount <= 0 || (
+                $pricing['creator_wallet'] && $this->solana->verifyTokenPayment(
+                    $signature, $mintAddress, $pricing['creator_wallet'], $royaltyAmount, $tolerance
                 )
             );
 
             if (!$sellerPaid || !$platformPaid || !$royaltyPaid) {
                 Log::warning('Buy confirm blocked: payment not found in transaction', [
-                    'nft_id'          => $nft->id,
-                    'transaction_sig' => $request->transaction_sig,
-                    'pricing'         => $pricing,
-                    'treasury_wallet' => $treasuryWallet,
-                ]);
-
-                return response()->json([
-                    'success' => false,
-                    'message' => 'Payment not found in this transaction. Expected '
-                        . $pricing['seller_receives'] . ' SOL to the seller, '
-                        . $pricing['platform_fee'] . ' SOL to the platform'
-                        . ($pricing['royalty_amount'] > 0 ? ', and ' . $pricing['royalty_amount'] . ' SOL royalty to the creator.' : '.'),
-                ], 422);
-            }
-        } else {
-            // SPUMP payments transfer an SPL-token amount computed from
-            // a live SOL/SPUMP rate. Re-fetch that same rate now and
-            // verify each recipient's token account actually received
-            // the expected converted amount — with a tolerance band to
-            // absorb rate drift between the buyer's quote and this
-            // confirmation (the rate itself refreshes every 60s).
-            $spumpMint = env('SPUMP_MINT_ADDRESS');
-            $rateData  = $this->getSpumpRateData();
-
-            if (!$spumpMint || !$rateData) {
-                Log::error('Buy confirm blocked: SPUMP rate unavailable for verification', [
-                    'nft_id' => $nft->id,
-                ]);
-
-                return response()->json([
-                    'success' => false,
-                    'message' => 'Unable to verify SPUMP payment right now. Please try again shortly.',
-                ], 422);
-            }
-
-            $spumpPerSol  = (float) $rateData['spump_per_sol'];
-            $spumpTotal   = ceil($pricing['price_after_discount'] * $spumpPerSol);
-            $spumpFee     = ceil($spumpTotal * $pricing['platform_fee_percent'] / 100);
-            $spumpRoyalty = $pricing['is_resale'] ? ceil($spumpTotal * $pricing['royalty_percent'] / 100) : 0;
-            $spumpSeller  = $spumpTotal - $spumpFee - $spumpRoyalty;
-
-            // 5% covers normal rate volatility in that window without
-            // being loose enough for meaningful underpayment.
-            $tolerance = max($spumpTotal * 0.05, 1);
-
-            $sellerPaid = $this->solana->verifyTokenPayment(
-                $request->transaction_sig, $spumpMint, $pricing['seller_wallet'], $spumpSeller, $tolerance
-            );
-            $platformPaid = $spumpFee <= 0 || (
-                $treasuryWallet && $this->solana->verifyTokenPayment(
-                    $request->transaction_sig, $spumpMint, $treasuryWallet, $spumpFee, $tolerance
-                )
-            );
-            $royaltyPaid = $spumpRoyalty <= 0 || (
-                $pricing['creator_wallet'] && $this->solana->verifyTokenPayment(
-                    $request->transaction_sig, $spumpMint, $pricing['creator_wallet'], $spumpRoyalty, $tolerance
-                )
-            );
-
-            if (!$sellerPaid || !$platformPaid || !$royaltyPaid) {
-                Log::warning('Buy confirm blocked: SPUMP payment not found in transaction', [
                     'nft_id'           => $nft->id,
-                    'transaction_sig'  => $request->transaction_sig,
-                    'expected_seller'  => $spumpSeller,
-                    'expected_fee'     => $spumpFee,
-                    'expected_royalty' => $spumpRoyalty,
-                    'spump_per_sol'    => $spumpPerSol,
+                    'transaction_sig'  => $signature,
+                    'list_currency'    => $listCurrency,
+                    'payment_currency' => $paymentCurrency,
+                    'expected_seller'  => $sellerAmount,
+                    'expected_platform'=> $platformAmount,
+                    'expected_royalty' => $royaltyAmount,
+                    'treasury_wallet'  => $treasuryWallet,
                 ]);
 
+                $unit = strtoupper($paymentCurrency);
                 return response()->json([
                     'success' => false,
-                    'message' => 'SPUMP payment not found in this transaction. Expected ~' . $spumpSeller . ' SPUMP to the seller, ~' . $spumpFee . ' SPUMP to the platform'
-                        . ($spumpRoyalty > 0 ? ', and ~' . $spumpRoyalty . ' SPUMP royalty to the creator.' : '.'),
+                    'message' => "Payment not found in this transaction. Expected {$sellerAmount} {$unit} to the seller, {$platformAmount} {$unit} to the platform"
+                        . ($royaltyAmount > 0 ? ", and {$royaltyAmount} {$unit} royalty to the creator." : '.'),
                 ], 422);
+            }
+
+            $salePrice = $pricing['price_after_discount'];
+
+            // DB to ownership transfer — still inside the lock, so the
+            // next waiting confirm() for this collection only proceeds
+            // (and only counts this sale) once it's fully committed.
+            DB::transaction(function () use ($nft, $request, $salePrice, $signature) {
+                $previousOwner = $nft->wallet_address;
+
+                $nft->update([
+                    'wallet_address'  => $request->buyer_wallet,
+                    'is_listed'       => false,
+                    'sold_price'      => $salePrice,
+                    'list_price'      => null,
+                    'listed_at'       => null,
+                    'sold_to'         => $request->buyer_wallet,
+                    'sold_at'         => now(),
+                    'sold_tx'         => $signature,
+                    'previous_owner'  => $previousOwner,
+                ]);
+            });
+        } finally {
+            if ($discountLock) {
+                $discountLock->release();
             }
         }
-
-        $salePrice = $pricing['price_after_discount'];
-
-        // DB to ownership transfer 
-        DB::transaction(function () use ($nft, $request, $salePrice) {
-            $previousOwner = $nft->wallet_address;
-
-            $nft->update([
-                'wallet_address'  => $request->buyer_wallet,
-                'is_listed'       => false,
-                'sold_price'      => $salePrice,
-                'list_price'      => null,
-                'listed_at'       => null,
-                'sold_to'         => $request->buyer_wallet,
-                'sold_at'         => now(),
-                'sold_tx'         => $request->transaction_sig,
-                'previous_owner'  => $previousOwner,
-            ]);
-        });
 
         Log::info('NFT sold successfully', [
             'nft_id'       => $nft->id,
@@ -303,54 +347,15 @@ class BuyController extends Controller
                 'nft_name'       => $nft->name,
                 'mint_address'   => $nft->mint_address,
                 'new_owner'      => $request->buyer_wallet,
-                'transaction_sig'=> $request->transaction_sig,
-                'explorer_url'   => $this->solana->getExplorerUrl($request->transaction_sig, 'tx'),
+                'transaction_sig'=> $signature,
+                'explorer_url'   => $this->solana->getExplorerUrl($signature, 'tx'),
             ],
         ]);
     }
 
     private function getSpumpRateData(): ?array
     {
-        return Cache::remember('spump_price_data', 60, function () {
-
-            $spumpMint = env('SPUMP_MINT_ADDRESS');
-            $solMint   = 'So11111111111111111111111111111111111111112';
-
-            $response = Http::timeout(10)->get(
-                'https://lite-api.jup.ag/price/v3',
-                [
-                    'ids' => "{$spumpMint},{$solMint}"
-                ]
-            );
-
-            if (!$response->successful()) {
-                return null;
-            }
-
-            $prices = $response->json();
-
-            if (
-                !isset($prices[$spumpMint]['usdPrice']) ||
-                !isset($prices[$solMint]['usdPrice'])
-            ) {
-                return null;
-            }
-
-            $spumpUsd = (float) $prices[$spumpMint]['usdPrice'];
-            $solUsd   = (float) $prices[$solMint]['usdPrice'];
-
-            if ($spumpUsd <= 0) {
-                return null;
-            }
-
-            return [
-                'spump_per_sol' => round($solUsd / $spumpUsd),
-                'spump_usd'     => $spumpUsd,
-                'sol_usd'       => $solUsd,
-                'decimals'      => (int) ($prices[$spumpMint]['decimals'] ?? 6),
-                'updated_at'    => now()->toDateTimeString(),
-            ];
-        });
+        return $this->solana->getSpumpUsdcRate();
     }
 
     public function spumpPrice(): JsonResponse
@@ -366,12 +371,13 @@ class BuyController extends Controller
             }
 
             return response()->json([
-                'success' => true,
-                'spump_per_sol' => $data['spump_per_sol'],
-                'spump_usd' => $data['spump_usd'],
-                'sol_usd' => $data['sol_usd'],
-                'decimals' => $data['decimals'],
-                'updated_at' => $data['updated_at'],
+                'success'        => true,
+                'spump_per_usdc' => $data['spump_per_usdc'],
+                'spump_usd'      => $data['spump_usd'],
+                'usdc_usd'       => $data['usdc_usd'],
+                'decimals'       => $data['decimals'],
+                'usdc_decimals'  => $data['usdc_decimals'],
+                'updated_at'     => $data['updated_at'],
             ]);
 
         } catch (\Throwable $e) {

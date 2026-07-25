@@ -1,2 +1,5 @@
 *
 !.gitignore
+storage/app/secure/
+node-signer/node_modules/
+devnet-authority.json

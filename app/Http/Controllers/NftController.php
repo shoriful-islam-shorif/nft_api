@@ -4,8 +4,10 @@ namespace App\Http\Controllers;
 
 use App\Models\Nft;
 use App\Models\Collection;
+use App\Models\PlatformSetting;
 use App\Services\PinataService;
 use App\Services\SolanaService;
+use App\Services\SolanaSignerService;
 use Illuminate\Http\Request;
 use Illuminate\Http\JsonResponse;
 
@@ -22,7 +24,8 @@ class NftController extends Controller
 
     public function __construct(
         private PinataService $pinata,
-        private SolanaService $solana
+        private SolanaService $solana,
+        private SolanaSignerService $signer
     ) {}
 
     /**
@@ -71,8 +74,7 @@ class NftController extends Controller
         //     'attributes.*.value'      => 'required|string',
         // ]);
 
-
-          $validator = \Validator::make($request->all(), [
+        $validator = \Validator::make($request->all(), [
         'wallet_address'          => 'required|string',
         'name'                    => 'required|string|max:100',
         'description'             => 'required|string|max:1000',
@@ -83,7 +85,7 @@ class NftController extends Controller
         'category'                => 'required|in:' . implode(',', self::CATEGORIES),
 
         'edition_type'            => 'required|in:unlimited,limited',
-        'total_supply'            => 'required_if:edition_type,limited|nullable|integer|min:1|max:100000',
+        'total_supply'            => 'required_if:edition_type,limited|nullable|integer|min:1|max:10',
 
         'mint_price'              => 'required|numeric|min:0',
         'is_free_listing'         => 'boolean',
@@ -121,10 +123,22 @@ class NftController extends Controller
         }
 
         // ── Price Calculation ────────────────────────
-        $mintPrice       = (float) $request->mint_price;
-        $isFree          = (bool)  $request->is_free_listing;
-        $hasMintDiscount = (bool)  $request->has_mint_discount;
-        $discountPercent = (float) ($request->mint_discount_percent ?? 0);
+        // mint_price / is_free_listing / mint_discount_percent /
+        // has_buyer_discount / buyer_discount_percent /
+        // buyer_discount_max_uses are PLATFORM-WIDE admin settings (see
+        // AdminController::publicConfig() — the frontend's own NFT
+        // Studio page treats these as read-only, pulled from
+        // /api/config, not creator input). They must be read from
+        // PlatformSetting here too, NOT trusted from the request body —
+        // otherwise anyone calling this endpoint directly (bypassing the
+        // UI) could pass is_free_listing=1 / mint_price=0 and mint for
+        // free regardless of what the admin actually configured, since
+        // mint()'s payment check later only looks at what got stored
+        // here on this row.
+        $isFree          = (bool)  PlatformSetting::get('is_free_listing', true);
+        $mintPrice       = $isFree ? 0 : (float) PlatformSetting::get('mint_price', 5000);
+        $hasMintDiscount = !$isFree && (float) PlatformSetting::get('mint_discount_percent', 0) > 0;
+        $discountPercent = $hasMintDiscount ? (float) PlatformSetting::get('mint_discount_percent', 0) : 0;
         $networkFee      = self::NETWORK_FEE_SOL;
 
         if ($isFree) {
@@ -136,6 +150,16 @@ class NftController extends Controller
         } else {
             $priceAfter = $mintPrice;
         }
+
+        $hasBuyerDiscount     = (bool) PlatformSetting::get('buyer_discount_percent', 0) > 0;
+        $buyerDiscountPercent = $hasBuyerDiscount ? (float) PlatformSetting::get('buyer_discount_percent', 0) : 0;
+        // buyer_discount_max_uses has no matching PlatformSetting key
+        // in publicConfig() currently — kept as a per-drop admin input
+        // for now (not attacker-exploitable on its own: it only limits
+        // how many buyers get the discount, it can't change what
+        // anyone actually pays), but flagged here since every OTHER
+        // discount field above is centrally controlled.
+        $buyerDiscountMaxUses = $request->buyer_discount_max_uses;
 
         $totalCost = $priceAfter + $networkFee;
 
@@ -167,8 +191,20 @@ class NftController extends Controller
             // ── Step 3: Metadata → Pinata ────────────
             $metadataResult = $this->pinata->uploadMetadata($metadata);
 
-            // ── Step 4: DB Save ──────────────────────
-            $nft = Nft::create([
+            //Step 4: DB Save 
+            // Edition / Total Supply fix: a "limited" edition of N must
+            // actually produce N independently-mintable rows (each will
+            // become its own on-chain token), not one row that gets
+            // marked "minted" and stops there. All N share the same
+            // artwork/metadata (uploaded once above) and an
+            // edition_group_id so supply can be tracked reliably —
+            // "how many rows in this group are minted" instead of a
+            // separate counter that can drift out of sync.
+            $editionType  = $request->edition_type;
+            $totalCopies  = $editionType === 'limited' ? max((int) $request->total_supply, 1) : 1;
+            $editionGroupId = (string) \Illuminate\Support\Str::uuid();
+
+            $baseRow = [
                 'name'                   => $request->name,
                 'description'            => $request->description,
                 'symbol'                 => $request->symbol ?? 'NFT',
@@ -178,40 +214,63 @@ class NftController extends Controller
                 'metadata_hash'          => $metadataResult['ipfs_hash'],
                 'collection_id'          => $request->collection_id,
                 'category'               => $request->category,
-                'edition_type'           => $request->edition_type,
-                'total_supply'           => $request->edition_type === 'limited' ? $request->total_supply : null,
+                'edition_type'           => $editionType,
+                'total_supply'           => $editionType === 'limited' ? $totalCopies : null,
+                'edition_group_id'       => $editionGroupId,
                 'mint_price'             => $mintPrice,
                 'is_free_listing'        => $isFree,
                 'has_mint_discount'      => $hasMintDiscount,
                 'mint_discount_percent'  => $discountPercent,
                 'price_after_discount'   => $priceAfter,
-                'has_buyer_discount'     => (bool) $request->has_buyer_discount,
-                'buyer_discount_percent' => $request->buyer_discount_percent ?? 0,
-                'buyer_discount_max_uses'=> $request->buyer_discount_max_uses,
+                'has_buyer_discount'     => $hasBuyerDiscount,
+                'buyer_discount_percent' => $buyerDiscountPercent,
+                'buyer_discount_max_uses'=> $buyerDiscountMaxUses,
                 'royalty'                => $request->royalty ?? 5,
-                'attributes' => $request->input('attributes', []),
                 'network'                => $this->solana->getNetwork(),
                 'network_fee'            => $networkFee,
                 'wallet_address'         => $request->wallet_address,
-                'creator_wallet'  => $request->wallet_address,
+                'creator_wallet'         => $request->wallet_address,
+                'attributes'             => json_encode($request->attributes ?? []),
                 'status'                 => 'pending',
-            ]);
+                'created_at'             => now(),
+                'updated_at'             => now(),
+            ];
+
+            $rows = [];
+            for ($i = 1; $i <= $totalCopies; $i++) {
+                $rows[] = array_merge($baseRow, ['edition_number' => $i]);
+            }
+
+            // Bulk-insert in chunks (fast even for large editions, e.g. 100000)
+            foreach (array_chunk($rows, 500) as $chunk) {
+                \DB::table('nfts')->insert($chunk);
+            }
+
+            $nftIds = Nft::where('edition_group_id', $editionGroupId)
+                ->orderBy('edition_number')
+                ->pluck('id')
+                ->values();
 
             return response()->json([
                 'success' => true,
-                'message' => 'NFT ready to mint! 🎉',
+                'message' => $totalCopies > 1
+                    ? "NFT ready to mint! {$totalCopies} copies created — mint them one by one. 🎉"
+                    : 'NFT ready to mint! 🎉',
                 'data'    => [
-                    'nft_id'       => $nft->id,
-                    'metadata_uri' => $metadataResult['metadata_uri'],
-                    'image_url'    => $imageResult['url'],
-                    'wallet'       => $request->wallet_address,
-                    'network'      => $this->solana->getNetwork(),
-                    'pricing'      => [
-                        'mint_price'           => $mintPrice . ' SOL',
+                    'nft_id'           => $nftIds->first(),
+                    'nft_ids'          => $nftIds,
+                    'edition_group_id' => $editionGroupId,
+                    'total_supply'     => $editionType === 'limited' ? $totalCopies : null,
+                    'metadata_uri'     => $metadataResult['metadata_uri'],
+                    'image_url'        => $imageResult['url'],
+                    'wallet'           => $request->wallet_address,
+                    'network'          => $this->solana->getNetwork(),
+                    'pricing'          => [
+                        'mint_price'           => $mintPrice . ' SPUMP',
                         'discount'             => $discountPercent . '%',
-                        'price_after_discount' => $priceAfter . ' SOL',
+                        'price_after_discount' => $priceAfter . ' SPUMP',
                         'network_fee'          => $networkFee . ' SOL',
-                        'total_cost'           => $totalCost . ' SOL',
+                        'total_cost'           => $totalCost . ' SPUMP + ' . $networkFee . ' SOL',
                         'is_free'              => $isFree,
                     ],
                     'next_step' => 'Use metadata_uri to mint via Phantom Wallet',
@@ -288,6 +347,7 @@ class NftController extends Controller
             'mint_address'    => 'required|string',
             'transaction_sig' => 'required|string',
             'wallet_address'  => 'required|string',
+            'payment_currency'=> 'nullable|string|in:spump,usdc',
         ]);
 
         \Log::info('Mint confirm request received', [
@@ -320,40 +380,72 @@ class NftController extends Controller
 
             $nft = Nft::findOrFail($request->nft_id);
 
+            if ($nft->status === 'minted') {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'This NFT copy has already been minted.',
+                ], 422);
+            }
+
             // ── Payment Verification ─────────────────────────────
             // Confirming the signature landed on-chain is NOT enough —
             // it proves *a* transaction happened, not that this one
-            // actually paid the mint price to the platform. Check the
-            // treasury wallet's balance actually increased by the
-            // expected amount inside this exact transaction.
+            // actually paid the mint price to the platform. The admin
+            // sets mint_price in SPUMP (the reference currency), but
+            // the minter can pay in either SPUMP or USDC — convert via
+            // the live rate if they chose USDC.
             if (!$nft->is_free_listing && (float) $nft->price_after_discount > 0) {
-                $treasuryWallet = config('services.platform.wallet');
+                $treasuryWallet   = $this->solana->getTreasuryWallet();
+                $paymentCurrency  = $request->input('payment_currency', 'spump');
+                $expectedAmount   = (float) $nft->price_after_discount; // in SPUMP
+                $tolerance        = 0.0005;
 
-                if (!$treasuryWallet) {
-                    \Log::error('Mint confirm blocked: platform wallet not configured');
+                if ($paymentCurrency === 'usdc') {
+                    $rateData = $this->solana->getSpumpUsdcRate();
+                    if (!$rateData) {
+                        \Log::error('Mint confirm blocked: SPUMP/USDC rate unavailable', ['nft_id' => $nft->id]);
+                        return response()->json([
+                            'success' => false,
+                            'message' => 'Unable to verify payment right now (rate unavailable). Please try again shortly.',
+                        ], 422);
+                    }
+                    // Listed/priced in SPUMP, minter paid in USDC.
+                    $expectedAmount = $expectedAmount / (float) $rateData['spump_per_usdc'];
+                    $tolerance      = max($expectedAmount * 0.05, $tolerance);
+                }
+
+                $mintAddress = $paymentCurrency === 'usdc'
+                    ? config('services.tokens.usdc_mint')
+                    : config('services.tokens.spump_mint');
+
+                if (!$treasuryWallet || !$mintAddress) {
+                    \Log::error('Mint confirm blocked: platform wallet or payment token mint not configured');
                     return response()->json([
                         'success' => false,
-                        'message' => 'Platform wallet is not configured. Please contact support.',
+                        'message' => 'Platform payment is not configured. Please contact support.',
                     ], 500);
                 }
 
-                $paid = $this->solana->verifyPayment(
+                $paid = $this->solana->verifyTokenPayment(
                     $request->transaction_sig,
+                    $mintAddress,
                     $treasuryWallet,
-                    (float) $nft->price_after_discount
+                    $expectedAmount,
+                    $tolerance
                 );
 
                 if (!$paid) {
                     \Log::warning('Mint confirm blocked: payment not found in transaction', [
-                        'nft_id'          => $nft->id,
-                        'transaction_sig' => $request->transaction_sig,
-                        'expected_amount' => $nft->price_after_discount,
-                        'treasury_wallet' => $treasuryWallet,
+                        'nft_id'           => $nft->id,
+                        'transaction_sig'  => $request->transaction_sig,
+                        'payment_currency' => $paymentCurrency,
+                        'expected_amount'  => $expectedAmount,
+                        'treasury_wallet'  => $treasuryWallet,
                     ]);
 
                     return response()->json([
                         'success' => false,
-                        'message' => 'Payment not found in this transaction. Expected ' . $nft->price_after_discount . ' SOL to the platform wallet.',
+                        'message' => 'Payment not found in this transaction. Expected ' . $expectedAmount . ' ' . strtoupper($paymentCurrency) . ' to the platform wallet.',
                     ], 422);
                 }
             }
@@ -444,12 +536,16 @@ class NftController extends Controller
         return response()->json([
             'success' => true,
             'data'    => [
-                'mint_price'           => round($mintPrice, 9) . ' SOL',
+                'mint_price'           => round($mintPrice, 9) . ' SPUMP',
                 'discount_percent'     => $discount . '%',
-                'discount_amount'      => round($mintPrice * $discount / 100, 9) . ' SOL',
-                'price_after_discount' => round($priceAfter, 9) . ' SOL',
+                'discount_amount'      => round($mintPrice * $discount / 100, 9) . ' SPUMP',
+                'price_after_discount' => round($priceAfter, 9) . ' SPUMP',
+                // Network fee is always paid in SOL (a Solana protocol
+                // requirement, independent of what currency the mint
+                // price itself is set in) — kept separate rather than
+                // summed into price_after_discount, since SPUMP and SOL
+                // are different tokens and can't be added together.
                 'network_fee'          => $networkFee . ' SOL',
-                'total_cost'           => round($priceAfter + $networkFee, 9) . ' SOL',
                 'is_free'              => $isFree,
             ],
         ]);
@@ -497,6 +593,32 @@ class NftController extends Controller
     }
 
     /**
+     * Edition Supply — live count of how many copies exist / are minted
+     * GET /api/nft/edition/{edition_group_id}/supply
+     */
+    public function editionSupply(string $editionGroupId): JsonResponse
+    {
+        $total  = Nft::where('edition_group_id', $editionGroupId)->count();
+
+        if ($total === 0) {
+            return response()->json(['success' => false, 'message' => 'Edition not found.'], 404);
+        }
+
+        $minted = Nft::where('edition_group_id', $editionGroupId)->where('status', 'minted')->count();
+
+        return response()->json([
+            'success' => true,
+            'data'    => [
+                'edition_group_id' => $editionGroupId,
+                'total_supply'     => $total,
+                'minted_count'     => $minted,
+                'remaining'        => max($total - $minted, 0),
+                'sold_out'         => $minted >= $total,
+            ],
+        ]);
+    }
+
+    /**
      * Single NFT Details
      * GET /api/nft/{mint_address}
      */
@@ -510,6 +632,124 @@ class NftController extends Controller
             'success' => true,
             'data'    => array_merge($nft->toArray(), [
                 'explorer_url' => $this->solana->getExplorerUrl($mintAddress),
+            ]),
+        ]);
+    }
+
+    /**
+     * Import Preview
+     * POST /api/nft/import/preview
+     *
+     * Given a mint address and the wallet claiming to own it, fetches
+     * the NFT's on-chain + off-chain metadata (auto-detecting mpl-core
+     * vs legacy Token Metadata) and confirms that wallet currently
+     * holds it. Read-only — nothing is saved yet.
+     */
+    public function importPreview(Request $request): JsonResponse
+    {
+        $request->validate([
+            'mint_address'   => 'required|string',
+            'wallet_address' => 'required|string',
+        ]);
+
+        if (Nft::where('mint_address', $request->mint_address)->exists()) {
+            return response()->json([
+                'success' => false,
+                'message' => 'This NFT is already on the platform.',
+            ], 422);
+        }
+
+        $result = $this->signer->fetchExternalNft($request->mint_address);
+
+        if (!($result['success'] ?? false)) {
+            return response()->json([
+                'success' => false,
+                'message' => $result['error'] ?? 'Could not find or read this NFT on-chain.',
+            ], 422);
+        }
+
+        if (!$result['current_owner']) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Could not determine the current owner of this NFT.',
+            ], 422);
+        }
+
+        if ($result['current_owner'] !== $request->wallet_address) {
+            return response()->json([
+                'success' => false,
+                'message' => 'This wallet does not currently hold this NFT.',
+            ], 403);
+        }
+
+        return response()->json(['success' => true, 'data' => $result]);
+    }
+
+    /**
+     * Import
+     * POST /api/nft/import
+     *
+     * Re-verifies ownership (never trust a client-supplied claim from a
+     * moment ago — re-check right before writing to the DB) and creates
+     * a platform record for this externally-minted NFT so it can be
+     * listed on the marketplace like any other.
+     */
+    public function import(Request $request): JsonResponse
+    {
+        $request->validate([
+            'mint_address'   => 'required|string',
+            'wallet_address' => 'required|string',
+            'category'       => 'nullable|string|in:' . implode(',', self::CATEGORIES),
+        ]);
+
+        if (Nft::where('mint_address', $request->mint_address)->exists()) {
+            return response()->json([
+                'success' => false,
+                'message' => 'This NFT is already on the platform.',
+            ], 422);
+        }
+
+        $result = $this->signer->fetchExternalNft($request->mint_address);
+
+        if (!($result['success'] ?? false)) {
+            return response()->json([
+                'success' => false,
+                'message' => $result['error'] ?? 'Could not find or read this NFT on-chain.',
+            ], 422);
+        }
+
+        if (($result['current_owner'] ?? null) !== $request->wallet_address) {
+            return response()->json([
+                'success' => false,
+                'message' => 'This wallet does not currently hold this NFT.',
+            ], 403);
+        }
+
+        $creators     = $result['creators'] ?? [];
+        $creatorWallet = $creators[0]['address'] ?? $result['update_authority'] ?? $request->wallet_address;
+
+        $nft = Nft::create([
+            'wallet_address'  => $request->wallet_address,
+            'creator_wallet'  => $creatorWallet,
+            'name'            => $result['name'] ?? 'Untitled',
+            'description'     => $result['description'] ?? '',
+            'image_url'       => $result['image_url'],
+            'metadata_uri'    => $result['uri'] ?? null,
+            'mint_address'    => $request->mint_address,
+            'royalty'         => round(($result['seller_fee_basis_points'] ?? 0) / 100, 2),
+            'category'        => $request->input('category', 'other'),
+            'status'          => 'minted',
+            'minted_at'       => now(),
+            'minted_count'    => 1,
+            'token_standard'  => $result['token_standard'],
+            'source'          => 'imported',
+        ]);
+
+        return response()->json([
+            'success' => true,
+            'message' => 'NFT imported successfully! You can now list it on the marketplace.',
+            'data'    => array_merge($nft->toArray(), [
+                'explorer_url' => $this->solana->getExplorerUrl($request->mint_address),
             ]),
         ]);
     }

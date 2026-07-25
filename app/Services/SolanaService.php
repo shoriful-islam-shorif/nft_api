@@ -3,6 +3,7 @@
 namespace App\Services;
 
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Cache;
 use Exception;
 
 class SolanaService
@@ -192,6 +193,20 @@ class SolanaService
     }
 
     /**
+     * Resolve the platform's NFT-transfer-delegate wallet — the hot
+     * wallet approved (at listing time) as the mpl-core TransferDelegate
+     * authority for marketplace sales. Deliberately a separate identity
+     * from the treasury wallet (getTreasuryWallet()) that only ever
+     * receives fee payments; this one only ever signs transfer
+     * instructions, never touches funds directly.
+     */
+    public function getDelegateWallet(): ?string
+    {
+        $dbWallet = \App\Models\PlatformSetting::get('delegate_wallet');
+        return $dbWallet ?: config('services.platform.delegate_wallet');
+    }
+
+    /**
      * Resolve the platform treasury wallet. The admin dashboard lets an
      * admin override this via `platform_settings` (key: platform_wallet);
      * fall back to the .env default when no override is set. Every place
@@ -278,6 +293,73 @@ class SolanaService
         $received = ($postRaw - $preRaw) / (10 ** $decimals);
 
         return $received >= ($expectedAmount - $tolerance);
+    }
+
+    /**
+     * Live SPUMP↔USDC rate via Jupiter's price API — shared by mint
+     * and buy/sell flows so there's one source of truth. Cached 60s.
+     */
+    public function getSpumpUsdcRate(): ?array
+    {
+        // Only cache SUCCESSFUL lookups. If we cached failures too, a
+        // transient Jupiter API hiccup (or a config value that was just
+        // fixed) would leave the frontend stuck showing null/"Loading..."
+        // for up to 60s even after the underlying problem is gone.
+        $cached = Cache::get('spump_price_data');
+        if ($cached !== null) {
+            return $cached;
+        }
+
+        $spumpMint = config('services.tokens.spump_mint');
+        $usdcMint  = config('services.tokens.usdc_mint');
+
+        if (!$spumpMint || !$usdcMint) {
+            \Illuminate\Support\Facades\Log::error('SPUMP/USDC rate unavailable: token mint(s) not configured', [
+                'spump_mint_set' => (bool) $spumpMint,
+                'usdc_mint_set'  => (bool) $usdcMint,
+            ]);
+            return null;
+        }
+
+        try {
+            $response = Http::timeout(10)->get(
+                'https://lite-api.jup.ag/price/v3',
+                ['ids' => "{$spumpMint},{$usdcMint}"]
+            );
+        } catch (Exception $e) {
+            \Illuminate\Support\Facades\Log::error('SPUMP/USDC rate fetch threw', ['message' => $e->getMessage()]);
+            return null;
+        }
+
+        if (!$response->successful()) {
+            \Illuminate\Support\Facades\Log::error('SPUMP/USDC rate fetch failed', ['status' => $response->status(), 'body' => $response->body()]);
+            return null;
+        }
+
+        $prices = $response->json();
+        if (!isset($prices[$spumpMint]['usdPrice']) || !isset($prices[$usdcMint]['usdPrice'])) {
+            \Illuminate\Support\Facades\Log::error('SPUMP/USDC rate fetch missing price data', ['prices' => $prices, 'spump_mint' => $spumpMint, 'usdc_mint' => $usdcMint]);
+            return null;
+        }
+
+        $spumpUsd = (float) $prices[$spumpMint]['usdPrice'];
+        $usdcUsd  = (float) $prices[$usdcMint]['usdPrice'];
+        if ($spumpUsd <= 0) {
+            return null;
+        }
+
+        $result = [
+            'spump_per_usdc' => round($usdcUsd / $spumpUsd, 6),
+            'spump_usd'      => $spumpUsd,
+            'usdc_usd'       => $usdcUsd,
+            'decimals'       => (int) ($prices[$spumpMint]['decimals'] ?? 6),
+            'usdc_decimals'  => (int) ($prices[$usdcMint]['decimals'] ?? 6),
+            'updated_at'     => now()->toDateTimeString(),
+        ];
+
+        Cache::put('spump_price_data', $result, 60);
+
+        return $result;
     }
 
     /**

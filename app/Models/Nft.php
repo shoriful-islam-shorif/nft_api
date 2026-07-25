@@ -21,16 +21,19 @@ class Nft extends Model
 
         // Collection
         'collection_id', 
+        'token_standard', 'source',
         'category',
 
         // Supply
         'edition_type', 
         'total_supply', 
         'minted_count',
+        'edition_group_id',
+        'edition_number',
 
         // Pricing
         'mint_price', 'is_free_listing',
-        'has_mint_discount', 'mint_discount_percent', 'price_after_discount',
+        'has_mint_discount', 'mint_discount_percent', 'price_after_discount', "list_currency",
 
         // Buyer Discount
         'has_buyer_discount', 'buyer_discount_percent', 'buyer_discount_max_uses',
@@ -43,7 +46,7 @@ class Nft extends Model
 
         // Status
         'status', 'minted_at','is_listed', 'list_price', 'listed_at',
-        'sold_to', 'sold_at', 'sold_tx', 'previous_owner',
+        'sold_to', 'sold_at', 'sold_tx', 'previous_owner','sold_price',
 
         
     ];
@@ -68,6 +71,30 @@ class Nft extends Model
     public function collection()
     {
         return $this->belongsTo(Collection::class);
+    }
+
+    // All copies that belong to the same edition (including this one)
+    public function editionSiblings()
+    {
+        if (!$this->edition_group_id) {
+            return static::where('id', $this->id);
+        }
+        return static::where('edition_group_id', $this->edition_group_id);
+    }
+
+    // How many copies of this edition have actually been minted so far
+    public function getEditionMintedCountAttribute(): int
+    {
+        return $this->editionSiblings()->where('status', 'minted')->count();
+    }
+
+    // How many copies are still available to mint (null = unlimited)
+    public function getEditionRemainingAttribute(): ?int
+    {
+        if ($this->edition_type !== 'limited' || !$this->total_supply) {
+            return null;
+        }
+        return max($this->total_supply - $this->getEditionMintedCountAttribute(), 0);
     }
 
     // Price after discount calculate 

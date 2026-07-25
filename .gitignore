@@ -22,3 +22,24 @@
 Homestead.json
 Homestead.yaml
 Thumbs.db
+
+ 
+# node-signer/ er nijer node_modules (upor-er /node_modules pattern eta cover kore na)
+node-signer/node_modules
+node-signer/*.log
+ 
+# 🔐 Private keypair / secret key file 
+storage/app/secure/*.json
+node-signer/devnet-authority.json
+node-signer/test-wallet*.json
+node-signer/*-keypair.json
+ 
+# Storage-er compiled/cache/generated content
+storage/framework/cache/*
+!storage/framework/cache/.gitkeep
+storage/framework/sessions/*
+!storage/framework/sessions/.gitkeep
+storage/framework/views/*
+!storage/framework/views/.gitkeep
+storage/framework/testing/*
+!storage/framework/testing/.gitkeep
