@@ -79,7 +79,7 @@ class NftController extends Controller
         'name'                    => 'required|string|max:100',
         'description'             => 'required|string|max:1000',
         'symbol'                  => 'nullable|string|max:10',
-        'image'                   => 'required|file|mimes:jpg,jpeg,png,gif,webp|max:10240',
+        'image'                   => 'required|file|image|mimes:jpg,jpeg,png,gif,webp|max:10240|dimensions:max_width=8000,max_height=8000',
 
         'collection_id'           => 'nullable|exists:collections,id',
         'category'                => 'required|in:' . implode(',', self::CATEGORIES),
@@ -733,7 +733,7 @@ class NftController extends Controller
             'creator_wallet'  => $creatorWallet,
             'name'            => $result['name'] ?? 'Untitled',
             'description'     => $result['description'] ?? '',
-            'image_url'       => $result['image_url'],
+            'image_url'       => $result['image_url'] ?? null,
             'metadata_uri'    => $result['uri'] ?? null,
             'mint_address'    => $request->mint_address,
             'royalty'         => round(($result['seller_fee_basis_points'] ?? 0) / 100, 2),

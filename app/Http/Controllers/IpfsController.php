@@ -17,7 +17,7 @@ class IpfsController extends Controller
     public function uploadImage(Request $request): JsonResponse
     {
         $request->validate([
-            'image' => 'required|file|mimes:jpg,jpeg,png,gif,webp|max:10240',
+            'image' => 'required|file|image|mimes:jpg,jpeg,png,gif,webp|max:10240|dimensions:max_width=8000,max_height=8000',
             'name'  => 'required|string|max:100',
         ]);
 
