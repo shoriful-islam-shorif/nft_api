@@ -101,6 +101,19 @@ class NftController extends Controller
         'attributes'             => 'nullable|array',
         'attributes.*.trait_type' => 'required|string',
         'attributes.*.value'      => 'required|string',
+
+        // External links — all optional
+        'external_website'   => 'nullable|url|max:255',
+        'external_discord'   => 'nullable|url|max:255',
+        'external_twitter'   => 'nullable|url|max:255',
+        'external_sosay'      => 'nullable|url|max:255',
+
+        // Unlockable content — optional, buyer/owner-only (see Nft
+        // model's $hidden + NftController@show)
+        'unlockable_content' => 'nullable|string|max:5000',
+
+        // Explicit/sensitive content flag
+        'is_explicit'        => 'boolean',
     ]);
 
     // ❌ RETURN JSON (NO REDIRECT)
@@ -231,6 +244,12 @@ class NftController extends Controller
                 'wallet_address'         => $request->wallet_address,
                 'creator_wallet'         => $request->wallet_address,
                 'attributes'             => json_encode($request->attributes ?? []),
+                'external_website'       => $request->external_website,
+                'external_discord'       => $request->external_discord,
+                'external_twitter'       => $request->external_twitter,
+                'external_sosay'         => $request->external_sosay,
+                'unlockable_content'     => $request->unlockable_content,
+                'is_explicit'            => (bool) $request->is_explicit,
                 'status'                 => 'pending',
                 'created_at'             => now(),
                 'updated_at'             => now(),
@@ -622,15 +641,27 @@ class NftController extends Controller
      * Single NFT Details
      * GET /api/nft/{mint_address}
      */
-    public function show(string $mintAddress): JsonResponse
+    public function show(Request $request,string $mintAddress): JsonResponse
     {
         $nft = Nft::where('mint_address', $mintAddress)
             ->with('collection')
             ->firstOrFail();
-
+        
+        $data = $nft->toArray(); // unlockable_content excluded here ($hidden)
+        unset($data['unlockable_content']);
+ 
+        // Only the current owner ever sees unlockable content — pass
+        // ?viewer_wallet=<wallet> to check. wallet_address tracks the
+        // current owner (updated on every sale in BuyController), so
+        // this stays correct after resales without extra lookups.
+        if ($request->viewer_wallet && $nft->wallet_address === $request->viewer_wallet) {
+            $data['unlockable_content'] = $nft->unlockable_content;
+        }
+ 
+ 
         return response()->json([
             'success' => true,
-            'data'    => array_merge($nft->toArray(), [
+            'data'    => array_merge($data, [
                 'explorer_url' => $this->solana->getExplorerUrl($mintAddress),
             ]),
         ]);

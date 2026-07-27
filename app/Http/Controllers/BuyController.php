@@ -313,13 +313,14 @@ class BuyController extends Controller
             // DB to ownership transfer — still inside the lock, so the
             // next waiting confirm() for this collection only proceeds
             // (and only counts this sale) once it's fully committed.
-            DB::transaction(function () use ($nft, $request, $salePrice, $signature) {
+            DB::transaction(function () use ($nft, $request, $salePrice, $signature, $listCurrency) {
                 $previousOwner = $nft->wallet_address;
 
                 $nft->update([
                     'wallet_address'  => $request->buyer_wallet,
                     'is_listed'       => false,
                     'sold_price'      => $salePrice,
+                    'sold_currency'   => $listCurrency, 
                     'list_price'      => null,
                     'listed_at'       => null,
                     'sold_to'         => $request->buyer_wallet,

@@ -46,7 +46,11 @@ class Nft extends Model
 
         // Status
         'status', 'minted_at','is_listed', 'list_price', 'listed_at',
-        'sold_to', 'sold_at', 'sold_tx', 'previous_owner','sold_price',
+        'sold_to', 'sold_at', 'sold_tx', 'previous_owner','sold_price','sold_currency',
+
+         // Links, unlockable content, content flag
+        'external_website', 'external_discord', 'external_twitter', 'external_sosay',
+        'unlockable_content', 'is_explicit',
 
         
     ];
@@ -64,8 +68,11 @@ class Nft extends Model
         'sold_price' => 'float',
         'listed_at'  => 'datetime',
         'attributes' => 'array',
+        'is_explicit' => 'boolean',
 
     ];
+
+    protected $hidden = ['unlockable_content'];
 
     // Collection relation
     public function collection()
