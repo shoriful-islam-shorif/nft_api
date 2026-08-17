@@ -42,7 +42,7 @@ class CollectionController extends Controller
     public function index(Request $request): JsonResponse
     {
         $query = Collection::withCount('nfts')
-            ->with(['nfts' => fn($q) => $q->where('status', 'minted')->limit(4)])
+            ->with(['nfts' => fn($q) => $q->where('status', 'minted')->storageVisible()->limit(4)])
             ->latest();
 
         if ($request->wallet) {
@@ -94,7 +94,8 @@ class CollectionController extends Controller
         $collection = Collection::withCount('nfts')->findOrFail($id);
 
         $nftQuery = Nft::where('collection_id', $id)
-            ->where('status', 'minted');
+            ->where('status', 'minted')
+            ->storageVisible();
 
         // Filter
         if ($request->category && $request->category !== 'all') {

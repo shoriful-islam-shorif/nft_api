@@ -10,7 +10,9 @@ class PlatformSettingSeeder extends Seeder
     public function run(): void
     {
         $settings = [
-            ['key' => 'mint_price', 'value' => '5000', 'type' => 'number', 'label' => 'Mint Price (SPUMP)'],
+            ['key' => 'mint_price', 'value' => '10', 'type' => 'number', 'label' => 'Mint Price (SPUMP)'],
+            ['key' => 'storage_fee_per_mb_spump', 'value' => '10', 'type' => 'number', 'label' => 'Storage Fee — SPUMP per MB per year'],
+            ['key' => 'storage_grace_period_days', 'value' => '14', 'type' => 'number', 'label' => 'Storage Grace Period (days after expiry before hiding from marketplace)'],
             ['key' => 'platform_fee_percent',  'value' => '3',     'type' => 'number',  'label' => 'Platform Fee (%)'],
             ['key' => 'is_free_listing',        'value' => 'true',  'type' => 'boolean', 'label' => 'Free Listing'],
             ['key' => 'mint_discount_percent',  'value' => '15',    'type' => 'number',  'label' => 'Mint Discount (%)'],

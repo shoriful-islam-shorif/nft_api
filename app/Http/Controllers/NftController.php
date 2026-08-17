@@ -5,9 +5,10 @@ namespace App\Http\Controllers;
 use App\Models\Nft;
 use App\Models\Collection;
 use App\Models\PlatformSetting;
-use App\Services\PinataService;
+use App\Services\LocalStorageService;
 use App\Services\SolanaService;
 use App\Services\SolanaSignerService;
+use App\Services\StorageFeeService;
 use Illuminate\Http\Request;
 use Illuminate\Http\JsonResponse;
 
@@ -23,9 +24,10 @@ class NftController extends Controller
     ];
 
     public function __construct(
-        private PinataService $pinata,
+        private LocalStorageService $storage,
         private SolanaService $solana,
-        private SolanaSignerService $signer
+        private SolanaSignerService $signer,
+        private StorageFeeService $storageFee
     ) {}
 
     /**
@@ -35,45 +37,6 @@ class NftController extends Controller
      */
     public function create(Request $request): JsonResponse
     {
-        // // ── Validation ───────────────────────────────
-        // $request->validate([
-        //     // Wallet (Identity)
-        //     'wallet_address'          => 'required|string',
-
-        //     // Basic Info
-        //     'name'                    => 'required|string|max:100',
-        //     'description'             => 'required|string|max:1000',
-        //     'symbol'                  => 'nullable|string|max:10',
-        //     'image'                   => 'required|file|mimes:jpg,jpeg,png,gif,webp|max:10240',
-
-        //     // Collection
-        //     'collection_id'           => 'nullable|exists:collections,id',
-        //     'category'                => 'required|in:' . implode(',', self::CATEGORIES),
-
-        //     // Supply
-        //     'edition_type'            => 'required|in:unlimited,limited',
-        //     'total_supply'            => 'required_if:edition_type,limited|nullable|integer|min:1|max:100000',
-
-        //     // Pricing
-        //     'mint_price'              => 'required|numeric|min:0',
-        //     'is_free_listing'         => 'boolean',
-
-        //     // Mint Discount
-        //     'has_mint_discount'       => 'boolean',
-        //     'mint_discount_percent'   => 'required_if:has_mint_discount,true|nullable|numeric|min:1|max:90',
-
-        //     // Buyer Discount
-        //     'has_buyer_discount'      => 'boolean',
-        //     'buyer_discount_percent'  => 'required_if:has_buyer_discount,true|nullable|numeric|min:1|max:90',
-        //     'buyer_discount_max_uses' => 'nullable|integer|min:1',
-
-        //     // Royalty & Attributes
-        //     'royalty'                 => 'nullable|numeric|min:0|max:50',
-        //     'attributes'              => 'nullable|array',
-        //     'attributes.*.trait_type' => 'required|string',
-        //     'attributes.*.value'      => 'required|string',
-        // ]);
-
         $validator = \Validator::make($request->all(), [
         'wallet_address'          => 'required|string',
         'name'                    => 'required|string|max:100',
@@ -177,8 +140,8 @@ class NftController extends Controller
         $totalCost = $priceAfter + $networkFee;
 
         try {
-            // ── Step 1: Image → Pinata ───────────────
-            $imageResult = $this->pinata->uploadImage(
+            // ── Step 1: Image → local disk ───────────
+            $imageResult = $this->storage->uploadImage(
                 $request->file('image'),
                 $request->name
             );
@@ -201,8 +164,8 @@ class NftController extends Controller
                     : null,
             ];
 
-            // ── Step 3: Metadata → Pinata ────────────
-            $metadataResult = $this->pinata->uploadMetadata($metadata);
+            // ── Step 3: Metadata → local disk ────────
+            $metadataResult = $this->storage->uploadMetadata($metadata);
 
             //Step 4: DB Save 
             // Edition / Total Supply fix: a "limited" edition of N must
@@ -223,6 +186,8 @@ class NftController extends Controller
                 'symbol'                 => $request->symbol ?? 'NFT',
                 'image_url'              => $imageResult['url'],
                 'image_hash'             => $imageResult['ipfs_hash'],
+                'image_size_bytes'       => $imageResult['size_bytes'],
+                'storage_fee_spump'      => $this->storageFee->calculateAnnualFeeSpump($imageResult['size_bytes']),
                 'metadata_uri'           => $metadataResult['metadata_uri'],
                 'metadata_hash'          => $metadataResult['ipfs_hash'],
                 'collection_id'          => $request->collection_id,
@@ -409,28 +374,33 @@ class NftController extends Controller
             // ── Payment Verification ─────────────────────────────
             // Confirming the signature landed on-chain is NOT enough —
             // it proves *a* transaction happened, not that this one
-            // actually paid the mint price to the platform. The admin
-            // sets mint_price in SPUMP (the reference currency), but
-            // the minter can pay in either SPUMP or USDC — convert via
-            // the live rate if they chose USDC.
-            if (!$nft->is_free_listing && (float) $nft->price_after_discount > 0) {
+            // actually paid what's owed to the platform. What's owed is
+            // mint price (0 if free listing) PLUS one year of storage
+            // fee — storage fee is NEVER waived by free_listing, since
+            // it's a real hosting cost (see LocalStorageService) rather
+            // than a promotional mint price. Both are billed together
+            // in a single payment, converted to USDC via the live rate
+            // if the minter chose to pay that way.
+            $mintPriceComponent   = (float) $nft->price_after_discount;
+            $storageFeeComponent  = (float) ($nft->storage_fee_spump ?? 0);
+            $expectedAmountSpump  = round($mintPriceComponent + $storageFeeComponent, 9);
+
+            if ($expectedAmountSpump > 0) {
                 $treasuryWallet   = $this->solana->getTreasuryWallet();
                 $paymentCurrency  = $request->input('payment_currency', 'spump');
-                $expectedAmount   = (float) $nft->price_after_discount; // in SPUMP
+                $expectedAmount   = $expectedAmountSpump; // in SPUMP
                 $tolerance        = 0.0005;
 
                 if ($paymentCurrency === 'usdc') {
-                    $rateData = $this->solana->getSpumpUsdcRate();
-                    if (!$rateData) {
+                    $expectedAmount = $this->storageFee->spumpToUsdc($expectedAmount);
+                    if ($expectedAmount === null) {
                         \Log::error('Mint confirm blocked: SPUMP/USDC rate unavailable', ['nft_id' => $nft->id]);
                         return response()->json([
                             'success' => false,
                             'message' => 'Unable to verify payment right now (rate unavailable). Please try again shortly.',
                         ], 422);
                     }
-                    // Listed/priced in SPUMP, minter paid in USDC.
-                    $expectedAmount = $expectedAmount / (float) $rateData['spump_per_usdc'];
-                    $tolerance      = max($expectedAmount * 0.05, $tolerance);
+                    $tolerance = max($expectedAmount * 0.05, $tolerance);
                 }
 
                 $mintAddress = $paymentCurrency === 'usdc'
@@ -455,36 +425,40 @@ class NftController extends Controller
 
                 if (!$paid) {
                     \Log::warning('Mint confirm blocked: payment not found in transaction', [
-                        'nft_id'           => $nft->id,
-                        'transaction_sig'  => $request->transaction_sig,
-                        'payment_currency' => $paymentCurrency,
-                        'expected_amount'  => $expectedAmount,
-                        'treasury_wallet'  => $treasuryWallet,
+                        'nft_id'              => $nft->id,
+                        'transaction_sig'     => $request->transaction_sig,
+                        'payment_currency'    => $paymentCurrency,
+                        'expected_amount'     => $expectedAmount,
+                        'mint_price_spump'    => $mintPriceComponent,
+                        'storage_fee_spump'   => $storageFeeComponent,
+                        'treasury_wallet'     => $treasuryWallet,
                     ]);
 
                     return response()->json([
                         'success' => false,
-                        'message' => 'Payment not found in this transaction. Expected ' . $expectedAmount . ' ' . strtoupper($paymentCurrency) . ' to the platform wallet.',
+                        'message' => 'Payment not found in this transaction. Expected ' . $expectedAmount . ' ' . strtoupper($paymentCurrency) . ' to the platform wallet (mint price + 1 year storage fee).',
                     ], 422);
                 }
             }
 
             $nft->update([
-                'mint_address'    => $request->mint_address,
-                'transaction_sig' => $request->transaction_sig,
-                'status'          => 'minted',
-                'minted_at'       => now(),
-                'minted_count'    => 1,
+                'mint_address'       => $request->mint_address,
+                'transaction_sig'    => $request->transaction_sig,
+                'status'             => 'minted',
+                'minted_at'          => now(),
+                'minted_count'       => 1,
+                'storage_paid_until' => now()->addYear(),
             ]);
 
             return response()->json([
                 'success' => true,
                 'message' => 'NFT minted successfully! ✅',
                 'data'    => [
-                    'mint_address' => $request->mint_address,
-                    'transaction'  => $request->transaction_sig,
-                    'explorer_url' => $this->solana->getExplorerUrl($request->mint_address),
-                    'wallet'       => $request->wallet_address,
+                    'mint_address'        => $request->mint_address,
+                    'transaction'         => $request->transaction_sig,
+                    'explorer_url'        => $this->solana->getExplorerUrl($request->mint_address),
+                    'wallet'              => $request->wallet_address,
+                    'storage_paid_until'  => $nft->fresh()->storage_paid_until,
                 ],
             ]);
 
@@ -521,6 +495,126 @@ class NftController extends Controller
                 'success' => false,
                 'message' => $message,
             ], 422);
+        }
+    }
+
+    /**
+     * Renew storage — pays for another year of hosting this NFT's
+     * image/metadata. Only the CURRENT owner can renew (wallet_address
+     * tracks current owner across sales — see BuyController), matching
+     * the "responsibility transfers to whoever owns it now" rule.
+     * Extends from the existing expiry if not yet expired (so renewing
+     * early never loses paid-for time), or from now() if it already
+     * lapsed.
+     * POST /api/nft/{id}/storage/renew
+     */
+    public function renewStorage(Request $request, int $id): JsonResponse
+    {
+        $request->validate([
+            'wallet_address'   => 'required|string',
+            'transaction_sig'  => 'required|string',
+            'payment_currency' => 'nullable|string|in:spump,usdc',
+        ]);
+
+        $nft = Nft::findOrFail($id);
+
+        if ($nft->wallet_address !== $request->wallet_address) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Only the current owner can renew storage for this NFT.',
+            ], 403);
+        }
+
+        if (!$nft->image_size_bytes) {
+            return response()->json([
+                'success' => false,
+                'message' => 'This NFT has no tracked image size — storage fee cannot be calculated. Please contact support.',
+            ], 422);
+        }
+
+        try {
+            $verified = $this->solana->getTransaction($request->transaction_sig) !== null
+                || $this->solana->isSignatureConfirmed($request->transaction_sig);
+
+            if (!$verified) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Transaction not confirmed yet. Please wait a moment and try again.',
+                ], 422);
+            }
+
+            // Recalculated fresh from current admin rate (not the
+            // mint-time cached value) — a renewal is a new purchase of
+            // another year at whatever the rate is now.
+            $renewalFeeSpump = $this->storageFee->calculateAnnualFeeSpump($nft->image_size_bytes);
+
+            $treasuryWallet  = $this->solana->getTreasuryWallet();
+            $paymentCurrency = $request->input('payment_currency', 'spump');
+            $expectedAmount  = $renewalFeeSpump;
+            $tolerance       = 0.0005;
+
+            if ($paymentCurrency === 'usdc') {
+                $expectedAmount = $this->storageFee->spumpToUsdc($expectedAmount);
+                if ($expectedAmount === null) {
+                    return response()->json([
+                        'success' => false,
+                        'message' => 'Unable to verify payment right now (rate unavailable). Please try again shortly.',
+                    ], 422);
+                }
+                $tolerance = max($expectedAmount * 0.05, $tolerance);
+            }
+
+            $mintAddress = $paymentCurrency === 'usdc'
+                ? config('services.tokens.usdc_mint')
+                : config('services.tokens.spump_mint');
+
+            if (!$treasuryWallet || !$mintAddress) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Platform payment is not configured. Please contact support.',
+                ], 500);
+            }
+
+            $paid = $this->solana->verifyTokenPayment(
+                $request->transaction_sig,
+                $mintAddress,
+                $treasuryWallet,
+                $expectedAmount,
+                $tolerance
+            );
+
+            if (!$paid) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Payment not found in this transaction. Expected ' . $expectedAmount . ' ' . strtoupper($paymentCurrency) . ' to the platform wallet.',
+                ], 422);
+            }
+
+            $extendsFrom = ($nft->storage_paid_until && $nft->storage_paid_until->isFuture())
+                ? $nft->storage_paid_until
+                : now();
+
+            $nft->update([
+                'storage_fee_spump'  => $renewalFeeSpump,
+                'storage_warning_sent_at' => null,
+                'storage_paid_until' => $extendsFrom->copy()->addYear(),
+            ]);
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Storage renewed for another year! ✅',
+                'data'    => [
+                    'storage_paid_until' => $nft->fresh()->storage_paid_until,
+                    'renewal_fee_spump'  => $renewalFeeSpump,
+                ],
+            ]);
+
+        } catch (\Exception $e) {
+            \Log::error('Storage renewal error', ['actual_error' => $e->getMessage(), 'nft_id' => $id]);
+            return response()->json([
+                'success' => false,
+                'message' => 'Storage renewal failed. Please try again.',
+            ], 500);
         }
     }
 

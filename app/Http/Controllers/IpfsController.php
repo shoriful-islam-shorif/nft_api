@@ -2,16 +2,52 @@
 
 namespace App\Http\Controllers;
 
-use App\Services\PinataService;
+use App\Services\LocalStorageService;
 use Illuminate\Http\Request;
 use Illuminate\Http\JsonResponse;
+use Illuminate\Support\Facades\Storage;
 
 class IpfsController extends Controller
 {
-    public function __construct(private PinataService $pinata) {}
+    public function __construct(private LocalStorageService $storage) {}
 
     /**
-     * Image → Pinata IPFS Upload
+     * Resolve a bare content hash (nft.image_hash — no extension) to the
+     * actual stored file and redirect to it.
+     *
+     * Why this exists: LocalStorageService saves files as
+     * "{sha256hash}.{ext}" on disk, but only the bare hash is stored in
+     * the nfts table (image_hash). A frontend that only has the hash
+     * can't build a working <img src> on its own — it doesn't know the
+     * extension. This endpoint does that lookup server-side: glob for
+     * "{hash}.*" in the nft-images dir and 302-redirect to whichever
+     * file matches, so the browser ends up loading the real URL either
+     * way (cached by the browser after the first hit).
+     *
+     * GET /api/image/{hash}
+     */
+    public function resolveByHash(string $hash)
+    {
+        // Guard against path traversal / junk input — a sha256 hex
+        // digest is always exactly 64 [0-9a-f] characters.
+        if (!preg_match('/^[a-f0-9]{64}$/i', $hash)) {
+            abort(404);
+        }
+
+        $disk  = Storage::disk('public');
+        $files = $disk->files('nft-images');
+
+        foreach ($files as $file) {
+            if (str_starts_with(basename($file), $hash . '.')) {
+                return redirect(rtrim(config('app.url'), '/') . '/storage/' . $file);
+            }
+        }
+
+        abort(404, 'Image not found for this hash.');
+    }
+
+    /**
+     * Image → local disk
      * POST /api/ipfs/upload-image
      */
     public function uploadImage(Request $request): JsonResponse
@@ -22,14 +58,14 @@ class IpfsController extends Controller
         ]);
 
         try {
-            $result = $this->pinata->uploadImage(
+            $result = $this->storage->uploadImage(
                 $request->file('image'),
                 $request->name
             );
 
             return response()->json([
                 'success'   => true,
-                'message'   => 'Image uploaded to IPFS',
+                'message'   => 'Image uploaded',
                 'data'      => $result,
             ]);
 
@@ -42,7 +78,7 @@ class IpfsController extends Controller
     }
 
     /**
-     * NFT Metadata → Pinata IPFS Upload
+     * NFT Metadata → local disk
      * POST /api/ipfs/upload-metadata
      */
     public function uploadMetadata(Request $request): JsonResponse
@@ -73,11 +109,11 @@ class IpfsController extends Controller
         ];
 
         try {
-            $result = $this->pinata->uploadMetadata($metadata);
+            $result = $this->storage->uploadMetadata($metadata);
 
             return response()->json([
                 'success'      => true,
-                'message'      => 'Metadata uploaded to IPFS',
+                'message'      => 'Metadata uploaded',
                 'data'         => $result,
                 'metadata'     => $metadata,
             ]);
@@ -91,17 +127,17 @@ class IpfsController extends Controller
     }
 
     /**
-     * Pinata to Unpin
+     * Remove a stored file by its content hash
      * DELETE /api/ipfs/unpin/{hash}
      */
     public function unpin(string $hash): JsonResponse
     {
         try {
-            $result = $this->pinata->unpin($hash);
+            $result = $this->storage->unpin($hash);
 
             return response()->json([
                 'success' => $result,
-                'message' => $result ? 'Unpinned successfully' : 'Unpin failed',
+                'message' => $result ? 'Removed successfully' : 'Remove failed — file not found',
             ]);
 
         } catch (\Exception $e) {

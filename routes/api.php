@@ -37,6 +37,7 @@ Route::prefix('collections')->group(function () {
 Route::prefix('nft')->group(function () {
     Route::post('/create',        [NftController::class, 'create']);
     Route::post('/mint',          [NftController::class, 'mint']);
+    Route::post('/{id}/storage/renew', [NftController::class, 'renewStorage']);
     Route::post('/calculate',     [NftController::class, 'calculate']);
     Route::post('/import/preview', [NftController::class, 'importPreview']);
     Route::post('/import',        [NftController::class, 'import']);
@@ -53,7 +54,7 @@ Route::prefix('marketplace')->group(function () {
     Route::get('/my-nfts/{wallet}', [MarketplaceController::class, 'myNfts']);
     Route::get('/edition/{edition_group_id}/listings', [MarketplaceController::class, 'editionListings']);
 });
-
+Route::get('/image/{id}', [MarketplaceController::class, 'show']);
 // Buy
 Route::prefix('buy')->group(function () {
     Route::get('/prepare/{nft_id}', [BuyController::class, 'prepare']);
@@ -63,6 +64,7 @@ Route::prefix('buy')->group(function () {
 
 
 Route::get('/image/{id}', [MarketplaceController::class, 'show']);
+Route::get('/image/hash/{hash}', [IpfsController::class, 'resolveByHash']);
 
 
 // ── Public config (frontend  ────────────────────────

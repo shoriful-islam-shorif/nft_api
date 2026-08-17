@@ -40,12 +40,8 @@ return [
     | Pinata IPFS Configuration
     |--------------------------------------------------------------------------
     */
-    'pinata' => [
-        'api_key'    => env('PINATA_API_KEY'),
-        'secret_key' => env('PINATA_SECRET_API_KEY'),
-        'gateway'    => env('PINATA_GATEWAY', 'https://ipfs.io/ipfs/'),
-    ],
-
+    // Pinata (IPFS) — removed. Images/metadata are now stored on local
+    // disk via App\Services\LocalStorageService (storage/app/public).
     /*
     |--------------------------------------------------------------------------
     | Solana Configuration

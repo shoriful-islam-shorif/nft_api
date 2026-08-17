@@ -19,6 +19,7 @@ class MarketplaceController extends Controller
     {
         $query = Nft::where('status', 'minted')
             ->where('is_listed', true)
+            ->storageVisible()
             ->with('collection');
 
 

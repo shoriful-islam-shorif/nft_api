@@ -320,7 +320,7 @@ class AdminController extends Controller
         // sets this directly in SPUMP) — there is no SOL mint price
         // anymore. USDC is derived live from the Jupiter SPUMP/USDC rate,
         // same source BuyController uses for purchase pricing.
-        $mintPriceSpump      = (float) PlatformSetting::get('mint_price', 5000);
+        $mintPriceSpump      = (float) PlatformSetting::get('mint_price', 10);
         $mintDiscountPercent = (float) PlatformSetting::get('mint_discount_percent', 15);
 
         $discountAmount     = $isFreeListing ? 0 : round($mintPriceSpump * ($mintDiscountPercent / 100), 6);
@@ -338,6 +338,7 @@ class AdminController extends Controller
                 'discount_amount'       => $discountAmount,
                 'price_after_discount'  => $priceAfterDiscount,
                 'buyer_discount_percent'=> PlatformSetting::get('buyer_discount_percent', 10),
+                'storage_fee_per_mb_spump' => (float) PlatformSetting::get('storage_fee_per_mb_spump', 10),
                 'spump_per_usdc'        => $rate['spump_per_usdc'] ?? null,
                 'spump_mint'            => config('services.tokens.spump_mint'),
                 'usdc_mint'             => config('services.tokens.usdc_mint'),
