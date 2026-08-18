@@ -337,29 +337,115 @@ class SolanaService
         }
 
         $prices = $response->json();
-        if (!isset($prices[$spumpMint]['usdPrice']) || !isset($prices[$usdcMint]['usdPrice'])) {
+
+        $spumpDecimals = (int) ($prices[$spumpMint]['decimals'] ?? 6);
+        $usdcDecimals  = (int) ($prices[$usdcMint]['decimals'] ?? 6);
+
+        // USDC virtually always has a confident usdPrice from the Price API
+        // (it's the world's most liquid stablecoin) — if THAT's missing,
+        // something is genuinely wrong (bad mint config, API outage) and
+        // there's no fallback that can help. But SPUMP alone can be
+        // missing 'usdPrice' even though Jupiter recognizes the mint and
+        // found its pool (decimals/liquidity/blockId present) — the Price
+        // API omits usdPrice when it isn't confident enough in a pool's
+        // liquidity to quote a price from it. Low-liquidity/new tokens hit
+        // this often; it doesn't mean the token is untradeable, just that
+        // the index API won't vouch for a number. The Quote API is a
+        // different code path — it computes a rate from a REAL swap route
+        // through that same pool regardless of the index's confidence
+        // threshold, so it's used here as a fallback specifically for that
+        // gap.
+        if (!isset($prices[$usdcMint]['usdPrice'])) {
             \Illuminate\Support\Facades\Log::error('SPUMP/USDC rate fetch missing price data', ['prices' => $prices, 'spump_mint' => $spumpMint, 'usdc_mint' => $usdcMint]);
             return null;
         }
 
-        $spumpUsd = (float) $prices[$spumpMint]['usdPrice'];
-        $usdcUsd  = (float) $prices[$usdcMint]['usdPrice'];
-        if ($spumpUsd <= 0) {
-            return null;
+        $usdcUsd = (float) $prices[$usdcMint]['usdPrice'];
+
+        $spumpUsd     = isset($prices[$spumpMint]['usdPrice']) ? (float) $prices[$spumpMint]['usdPrice'] : null;
+        $spumpPerUsdc = null;
+
+        if ($spumpUsd !== null && $spumpUsd > 0) {
+            $spumpPerUsdc = round($usdcUsd / $spumpUsd, 6);
+        } else {
+            // Fallback: ask Jupiter's Quote API what 1 USDC actually swaps
+            // to right now through the real on-chain route. This still
+            // works even when the Price API wouldn't vouch for a usdPrice,
+            // as long as SOME route/pool exists.
+            $quote = $this->getSpumpUsdcRateViaQuote($spumpMint, $usdcMint, $usdcDecimals, $spumpDecimals, $usdcUsd);
+            if ($quote === null) {
+                return null;
+            }
+            $spumpPerUsdc = $quote['spump_per_usdc'];
+            $spumpUsd     = $quote['spump_usd'];
         }
 
         $result = [
-            'spump_per_usdc' => round($usdcUsd / $spumpUsd, 6),
+            'spump_per_usdc' => $spumpPerUsdc,
             'spump_usd'      => $spumpUsd,
             'usdc_usd'       => $usdcUsd,
-            'decimals'       => (int) ($prices[$spumpMint]['decimals'] ?? 6),
-            'usdc_decimals'  => (int) ($prices[$usdcMint]['decimals'] ?? 6),
+            'decimals'       => $spumpDecimals,
+            'usdc_decimals'  => $usdcDecimals,
             'updated_at'     => now()->toDateTimeString(),
         ];
 
         Cache::put('spump_price_data', $result, 60);
 
         return $result;
+    }
+
+    /**
+     * Fallback used only when the Price API has a pool for SPUMP but
+     * won't return a confident usdPrice for it (common for low-liquidity
+     * tokens). Asks the Quote API for a real swap route: "1 USDC in, how
+     * much SPUMP out right now" — that's a live, on-chain-route-backed
+     * rate, not an index confidence score, so it works regardless of how
+     * thin the pool is (as long as a route exists at all).
+     */
+    private function getSpumpUsdcRateViaQuote(string $spumpMint, string $usdcMint, int $usdcDecimals, int $spumpDecimals, float $usdcUsd): ?array
+    {
+        // Quote for exactly 1 USDC worth of input, in USDC's smallest unit.
+        $oneUsdcRaw = (int) (1 * (10 ** $usdcDecimals));
+
+        try {
+            $response = Http::timeout(10)->get('https://lite-api.jup.ag/swap/v1/quote', [
+                'inputMint'   => $usdcMint,
+                'outputMint'  => $spumpMint,
+                'amount'      => $oneUsdcRaw,
+                'slippageBps' => 500, // generous — this is a rate lookup, not a real swap
+            ]);
+        } catch (Exception $e) {
+            \Illuminate\Support\Facades\Log::error('SPUMP/USDC quote fallback threw', ['message' => $e->getMessage()]);
+            return null;
+        }
+
+        if (!$response->successful()) {
+            \Illuminate\Support\Facades\Log::error('SPUMP/USDC quote fallback failed', ['status' => $response->status(), 'body' => $response->body()]);
+            return null;
+        }
+
+        $quote     = $response->json();
+        $outAmount = $quote['outAmount'] ?? null;
+
+        if (!$outAmount || (float) $outAmount <= 0) {
+            \Illuminate\Support\Facades\Log::error('SPUMP/USDC quote fallback: no route/outAmount', ['quote' => $quote, 'spump_mint' => $spumpMint, 'usdc_mint' => $usdcMint]);
+            return null;
+        }
+
+        // outAmount is how much SPUMP (raw, smallest-unit) 1 USDC bought —
+        // that IS spump_per_usdc once converted to whole-token units.
+        $spumpPerUsdc = round(((float) $outAmount) / (10 ** $spumpDecimals), 6);
+        if ($spumpPerUsdc <= 0) {
+            return null;
+        }
+
+        return [
+            'spump_per_usdc' => $spumpPerUsdc,
+            // Approximate — derived from the swap rate against USDC's own
+            // usdPrice, not a separate index price for SPUMP. Fine for
+            // display; not precise enough to rely on for anything else.
+            'spump_usd'      => round($usdcUsd / $spumpPerUsdc, 8),
+        ];
     }
 
     /**
