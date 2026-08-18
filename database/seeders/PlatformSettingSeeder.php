@@ -17,10 +17,10 @@ class PlatformSettingSeeder extends Seeder
             ['key' => 'is_free_listing',        'value' => 'true',  'type' => 'boolean', 'label' => 'Free Listing'],
             ['key' => 'mint_discount_percent',  'value' => '15',    'type' => 'number',  'label' => 'Mint Discount (%)'],
             ['key' => 'buyer_discount_percent', 'value' => '10',    'type' => 'number',  'label' => 'Buyer Discount (%)'],
-            ['key' => 'platform_wallet',        'value' => '',      'type' => 'string',  'label' => 'Platform Wallet Address'],
+            // ['key' => 'platform_wallet',        'value' => '',      'type' => 'string',  'label' => 'Platform Wallet Address'],
             ['key' => 'platform_name',          'value' => 'Scotty Pumpkin NFT', 'type' => 'string', 'label' => 'Platform Name'],
-            ['key' => 'max_file_size_mb',       'value' => '10',    'type' => 'number',  'label' => 'Max Upload Size (MB)'],
-            ['key' => 'nft_require_approval',   'value' => 'false', 'type' => 'boolean', 'label' => 'NFT Requires Admin Approval'],
+            ['key' => 'max_file_size_mb',       'value' => '7',    'type' => 'number',  'label' => 'Max Upload Size (MB)'],
+            // ['key' => 'nft_require_approval',   'value' => 'false', 'type' => 'boolean', 'label' => 'NFT Requires Admin Approval'],
         ];
 
         foreach ($settings as $s) {

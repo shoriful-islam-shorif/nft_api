@@ -42,7 +42,7 @@ class NftController extends Controller
         'name'                    => 'required|string|max:100',
         'description'             => 'required|string|max:1000',
         'symbol'                  => 'nullable|string|max:10',
-        'image'                   => 'required|file|image|mimes:jpg,jpeg,png,gif,webp|max:10240|dimensions:max_width=8000,max_height=8000',
+        'image'                   => 'required|file|image|mimes:jpg,jpeg,png,gif,webp|max:7240|dimensions:max_width=8000,max_height=8000',
 
         'collection_id'           => 'nullable|exists:collections,id',
         'category'                => 'required|in:' . implode(',', self::CATEGORIES),
@@ -112,7 +112,7 @@ class NftController extends Controller
         // mint()'s payment check later only looks at what got stored
         // here on this row.
         $isFree          = (bool)  PlatformSetting::get('is_free_listing', true);
-        $mintPrice       = $isFree ? 0 : (float) PlatformSetting::get('mint_price', 5000);
+        $mintPrice       = $isFree ? 0 : (float) PlatformSetting::get('mint_price', 10);
         $hasMintDiscount = !$isFree && (float) PlatformSetting::get('mint_discount_percent', 0) > 0;
         $discountPercent = $hasMintDiscount ? (float) PlatformSetting::get('mint_discount_percent', 0) : 0;
         $networkFee      = self::NETWORK_FEE_SOL;
