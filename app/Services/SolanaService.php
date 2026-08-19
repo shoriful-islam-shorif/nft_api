@@ -296,15 +296,22 @@ class SolanaService
     }
 
     /**
-     * Live SPUMP↔USDC rate via Jupiter's price API — shared by mint
-     * and buy/sell flows so there's one source of truth. Cached 60s.
+     * Live SPUMP↔USDC rate — shared by mint and buy/sell flows so there's
+     * one source of truth. Cached 60s (successful lookups only).
+     *
+     * Source chain: Jupiter is PRIMARY (Price API, falling back internally
+     * to Jupiter's own Quote API for low-liquidity pools it won't index a
+     * confident price for). If Jupiter is unreachable/down entirely — not
+     * just "no confident price", but the API itself failing — Raydium's
+     * public pool API is tried as a SECONDARY, independent source, since
+     * it doesn't depend on Jupiter's infrastructure at all.
      */
     public function getSpumpUsdcRate(): ?array
     {
         // Only cache SUCCESSFUL lookups. If we cached failures too, a
-        // transient Jupiter API hiccup (or a config value that was just
-        // fixed) would leave the frontend stuck showing null/"Loading..."
-        // for up to 60s even after the underlying problem is gone.
+        // transient API hiccup (or a config value that was just fixed)
+        // would leave the frontend stuck showing null/"Loading..." for up
+        // to 60s even after the underlying problem is gone.
         $cached = Cache::get('spump_price_data');
         if ($cached !== null) {
             return $cached;
@@ -321,6 +328,42 @@ class SolanaService
             return null;
         }
 
+        $result = $this->getSpumpUsdcRateViaJupiter($spumpMint, $usdcMint);
+
+        if ($result === null) {
+            \Illuminate\Support\Facades\Log::warning('SPUMP/USDC rate: Jupiter (primary) failed, trying Raydium (secondary)', [
+                'spump_mint' => $spumpMint,
+                'usdc_mint'  => $usdcMint,
+            ]);
+            $result = $this->getSpumpUsdcRateViaRaydium($spumpMint, $usdcMint);
+        }
+
+        if ($result === null) {
+            \Illuminate\Support\Facades\Log::error('SPUMP/USDC rate: both Jupiter and Raydium failed', [
+                'spump_mint' => $spumpMint,
+                'usdc_mint'  => $usdcMint,
+            ]);
+            return null;
+        }
+
+        $result['updated_at'] = now()->toDateTimeString();
+
+        Cache::put('spump_price_data', $result, 60);
+
+        return $result;
+    }
+
+    /**
+     * PRIMARY source. Jupiter Price API first; if it won't vouch for a
+     * confident usdPrice on SPUMP specifically (common for low-liquidity
+     * tokens — the pool is found but the index API withholds a number),
+     * falls back internally to Jupiter's own Quote API, which computes a
+     * rate from a real swap route regardless of that confidence threshold.
+     * Returns null only if Jupiter is unusable end-to-end (down, no
+     * config, no route at all) — that's the signal to try Raydium next.
+     */
+    private function getSpumpUsdcRateViaJupiter(string $spumpMint, string $usdcMint): ?array
+    {
         try {
             $response = Http::timeout(10)->get(
                 'https://lite-api.jup.ag/price/v3',
@@ -343,18 +386,8 @@ class SolanaService
 
         // USDC virtually always has a confident usdPrice from the Price API
         // (it's the world's most liquid stablecoin) — if THAT's missing,
-        // something is genuinely wrong (bad mint config, API outage) and
-        // there's no fallback that can help. But SPUMP alone can be
-        // missing 'usdPrice' even though Jupiter recognizes the mint and
-        // found its pool (decimals/liquidity/blockId present) — the Price
-        // API omits usdPrice when it isn't confident enough in a pool's
-        // liquidity to quote a price from it. Low-liquidity/new tokens hit
-        // this often; it doesn't mean the token is untradeable, just that
-        // the index API won't vouch for a number. The Quote API is a
-        // different code path — it computes a rate from a REAL swap route
-        // through that same pool regardless of the index's confidence
-        // threshold, so it's used here as a fallback specifically for that
-        // gap.
+        // something is genuinely wrong with this source (bad mint config,
+        // API outage), not just a thin SPUMP pool. Bail out to Raydium.
         if (!isset($prices[$usdcMint]['usdPrice'])) {
             \Illuminate\Support\Facades\Log::error('SPUMP/USDC rate fetch missing price data', ['prices' => $prices, 'spump_mint' => $spumpMint, 'usdc_mint' => $usdcMint]);
             return null;
@@ -368,10 +401,13 @@ class SolanaService
         if ($spumpUsd !== null && $spumpUsd > 0) {
             $spumpPerUsdc = round($usdcUsd / $spumpUsd, 6);
         } else {
-            // Fallback: ask Jupiter's Quote API what 1 USDC actually swaps
-            // to right now through the real on-chain route. This still
-            // works even when the Price API wouldn't vouch for a usdPrice,
-            // as long as SOME route/pool exists.
+            // SPUMP alone missing 'usdPrice' even though Jupiter recognizes
+            // the mint and found its pool (decimals/liquidity/blockId
+            // present) — the Price API omits usdPrice when it isn't
+            // confident enough in a pool's liquidity to quote a price from
+            // it. The Quote API is a different code path — it computes a
+            // rate from a REAL swap route through that same pool
+            // regardless of the index's confidence threshold.
             $quote = $this->getSpumpUsdcRateViaQuote($spumpMint, $usdcMint, $usdcDecimals, $spumpDecimals, $usdcUsd);
             if ($quote === null) {
                 return null;
@@ -380,18 +416,14 @@ class SolanaService
             $spumpUsd     = $quote['spump_usd'];
         }
 
-        $result = [
+        return [
             'spump_per_usdc' => $spumpPerUsdc,
             'spump_usd'      => $spumpUsd,
             'usdc_usd'       => $usdcUsd,
             'decimals'       => $spumpDecimals,
             'usdc_decimals'  => $usdcDecimals,
-            'updated_at'     => now()->toDateTimeString(),
+            'source'         => 'jupiter',
         ];
-
-        Cache::put('spump_price_data', $result, 60);
-
-        return $result;
     }
 
     /**
@@ -445,6 +477,109 @@ class SolanaService
             // usdPrice, not a separate index price for SPUMP. Fine for
             // display; not precise enough to rely on for anything else.
             'spump_usd'      => round($usdcUsd / $spumpPerUsdc, 8),
+        ];
+    }
+
+    /**
+     * SECONDARY source — only tried when Jupiter (Price API + its own
+     * Quote fallback) fails entirely, e.g. Jupiter's infrastructure is
+     * down/unreachable. Raydium runs independently of Jupiter, so it can
+     * still answer even during a Jupiter outage, as long as the pool is
+     * one Raydium itself hosts.
+     *
+     * Reads the highest-liquidity SPUMP/USDC pool's own reserve amounts
+     * and derives the spot rate directly from the reserve ratio
+     * (spump_reserve / usdc_reserve) — the same approach a constant-
+     * product AMM uses internally for its marginal price. This doesn't
+     * depend on any index/confidence score, only on the pool existing.
+     */
+    private function getSpumpUsdcRateViaRaydium(string $spumpMint, string $usdcMint): ?array
+    {
+        try {
+            $response = Http::timeout(10)->get('https://api-v3.raydium.io/pools/info/mint', [
+                'mint1'         => $spumpMint,
+                'mint2'         => $usdcMint,
+                'poolType'      => 'all',
+                'poolSortField' => 'liquidity',
+                'sortType'      => 'desc',
+                'pageSize'      => 1,
+                'page'          => 1,
+            ]);
+        } catch (Exception $e) {
+            \Illuminate\Support\Facades\Log::error('SPUMP/USDC Raydium fallback threw', ['message' => $e->getMessage()]);
+            return null;
+        }
+
+        if (!$response->successful()) {
+            \Illuminate\Support\Facades\Log::error('SPUMP/USDC Raydium fallback failed', ['status' => $response->status(), 'body' => $response->body()]);
+            return null;
+        }
+
+        $body  = $response->json();
+        $pools = $body['data']['data'] ?? $body['data'] ?? null;
+
+        if (!is_array($pools) || count($pools) === 0) {
+            \Illuminate\Support\Facades\Log::error('SPUMP/USDC Raydium fallback: no pool found', ['body' => $body, 'spump_mint' => $spumpMint, 'usdc_mint' => $usdcMint]);
+            return null;
+        }
+
+        $pool = $pools[0];
+
+        $mintAAddress = $pool['mintA']['address'] ?? null;
+        $mintBAddress = $pool['mintB']['address'] ?? null;
+        $amountA      = (float) ($pool['mintAmountA'] ?? 0);
+        $amountB      = (float) ($pool['mintAmountB'] ?? 0);
+        $spumpDecimals = (int) ($pool['mintA']['decimals'] ?? $pool['mintB']['decimals'] ?? 6);
+        $usdcDecimals  = (int) ($pool['mintB']['decimals'] ?? $pool['mintA']['decimals'] ?? 6);
+
+        if (!$mintAAddress || !$mintBAddress || $amountA <= 0 || $amountB <= 0) {
+            \Illuminate\Support\Facades\Log::error('SPUMP/USDC Raydium fallback: incomplete pool data', ['pool' => $pool]);
+            return null;
+        }
+
+        // Reserve amounts from this endpoint are already in human-readable
+        // (decimal-adjusted) units, not raw base units — figure out which
+        // side of the pool is SPUMP vs USDC before taking the ratio.
+        if ($mintAAddress === $spumpMint && $mintBAddress === $usdcMint) {
+            $spumpReserve = $amountA;
+            $usdcReserve  = $amountB;
+            $spumpDecimals = (int) ($pool['mintA']['decimals'] ?? 6);
+            $usdcDecimals  = (int) ($pool['mintB']['decimals'] ?? 6);
+        } elseif ($mintAAddress === $usdcMint && $mintBAddress === $spumpMint) {
+            $spumpReserve = $amountB;
+            $usdcReserve  = $amountA;
+            $spumpDecimals = (int) ($pool['mintB']['decimals'] ?? 6);
+            $usdcDecimals  = (int) ($pool['mintA']['decimals'] ?? 6);
+        } else {
+            \Illuminate\Support\Facades\Log::error('SPUMP/USDC Raydium fallback: pool mints do not match expected pair', ['pool' => $pool, 'spump_mint' => $spumpMint, 'usdc_mint' => $usdcMint]);
+            return null;
+        }
+
+        if ($usdcReserve <= 0) {
+            return null;
+        }
+
+        $spumpPerUsdc = round($spumpReserve / $usdcReserve, 6);
+        if ($spumpPerUsdc <= 0) {
+            return null;
+        }
+
+        // Raydium's pool payload usually includes each side's own USD
+        // price too (from its own price feed) — prefer that for usdc_usd
+        // if present, otherwise assume USDC ≈ $1 (safe for a stablecoin).
+        $usdcUsd = isset($pool['mintB']['price']) && $mintBAddress === $usdcMint
+            ? (float) $pool['mintB']['price']
+            : (isset($pool['mintA']['price']) && $mintAAddress === $usdcMint ? (float) $pool['mintA']['price'] : 1.0);
+
+        return [
+            'spump_per_usdc' => $spumpPerUsdc,
+            // Approximate — derived from pool reserve ratio, not a direct
+            // index price. Fine for display purposes.
+            'spump_usd'      => round($usdcUsd / $spumpPerUsdc, 8),
+            'usdc_usd'       => $usdcUsd,
+            'decimals'       => $spumpDecimals,
+            'usdc_decimals'  => $usdcDecimals,
+            'source'         => 'raydium',
         ];
     }
 
