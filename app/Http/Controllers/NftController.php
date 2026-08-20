@@ -67,9 +67,11 @@ class NftController extends Controller
 
         // External links — all optional
         'external_website'   => 'nullable|url|max:255',
-        'external_discord'   => 'nullable|url|max:255',
+        'external_social'    => 'nullable|url|max:255',
         'external_twitter'   => 'nullable|url|max:255',
         'external_sosay'      => 'nullable|url|max:255',
+        'external_telegram'  => 'nullable|url|max:255',
+        'external_whatsapp'  => 'nullable|string|max:255',
 
         // Unlockable content — optional, buyer/owner-only (see Nft
         // model's $hidden + NftController@show)
@@ -210,9 +212,11 @@ class NftController extends Controller
                 'creator_wallet'         => $request->wallet_address,
                 'attributes'             => json_encode($request->attributes ?? []),
                 'external_website'       => $request->external_website,
-                'external_discord'       => $request->external_discord,
+                'external_social'        => $request->external_social,
                 'external_twitter'       => $request->external_twitter,
                 'external_sosay'         => $request->external_sosay,
+                'external_telegram'      => $request->external_telegram,
+                'external_whatsapp'      => $request->external_whatsapp,
                 'unlockable_content'     => $request->unlockable_content,
                 'is_explicit'            => (bool) $request->is_explicit,
                 'status'                 => 'pending',

@@ -49,7 +49,7 @@ class Nft extends Model
         'sold_to', 'sold_at', 'sold_tx', 'previous_owner','sold_price','sold_currency',
 
          // Links, unlockable content, content flag
-        'external_website', 'external_discord', 'external_twitter', 'external_sosay',
+        'external_website', 'external_social', 'external_twitter', 'external_sosay','external_telegram', 'external_whatsapp',
         'unlockable_content', 'is_explicit',
 
         // Storage fee / rent

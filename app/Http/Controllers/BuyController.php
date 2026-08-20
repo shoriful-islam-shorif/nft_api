@@ -378,6 +378,7 @@ class BuyController extends Controller
                 'usdc_usd'       => $data['usdc_usd'],
                 'decimals'       => $data['decimals'],
                 'usdc_decimals'  => $data['usdc_decimals'],
+                'source'         => $data['source'] ?? null,
                 'updated_at'     => $data['updated_at'],
             ]);
 
