@@ -42,7 +42,7 @@ class NftController extends Controller
         'name'                    => 'required|string|max:100',
         'description'             => 'required|string|max:1000',
         'symbol'                  => 'nullable|string|max:10',
-        'image'                   => 'required|file|image|mimes:jpg,jpeg,png,gif,webp|max:7240|dimensions:max_width=8000,max_height=8000',
+        'image'                   => 'required|file|image|mimes:jpg,jpeg,png,gif,webp|max:50240|dimensions:max_width=8000,max_height=8000',
 
         'collection_id'           => 'nullable|exists:collections,id',
         'category'                => 'required|in:' . implode(',', self::CATEGORIES),
