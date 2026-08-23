@@ -38,8 +38,24 @@ class BuyController extends Controller
     {
         $listPrice = (float) $nft->list_price;
 
-        $hasBuyerDiscount     = (bool) $nft->has_buyer_discount;
-        $buyerDiscountPercent = (float) ($nft->buyer_discount_percent ?? 0);
+        // has_buyer_discount / buyer_discount_percent are PLATFORM-WIDE
+        // admin settings (same category as platform_fee_percent below) —
+        // read LIVE from PlatformSetting here, not from this NFT row's
+        // own stored columns. Those columns are only a snapshot captured
+        // at mint time (see NftController::create()); reading them here
+        // would mean an admin changing the discount in the admin panel
+        // never takes effect for any NFT minted before that change,
+        // which is exactly the bug this fixes — the buyer should always
+        // see today's actual discount, the same way they always see
+        // today's actual platform fee.
+        //
+        // buyer_discount_max_uses is intentionally NOT read live — it's
+        // a per-drop admin input captured at mint time (no matching
+        // PlatformSetting key), since "first N buyers of THIS drop" is
+        // meant to vary per collection/drop, unlike the discount %
+        // itself which is one global promotion setting.
+        $buyerDiscountPercent = (float) \App\Models\PlatformSetting::get('buyer_discount_percent', 0);
+        $hasBuyerDiscount     = $buyerDiscountPercent > 0;
         $buyerDiscountMaxUses = (int) ($nft->buyer_discount_max_uses ?? 0);
 
         // "First N buyers" only makes sense counted across the whole
