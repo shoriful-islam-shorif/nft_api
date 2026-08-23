@@ -103,14 +103,50 @@ class SolanaSignerService
     }
 
     /**
-     * @param  string $base64Tx  Partially-signed transaction (buyer's signature already present)
+     * @param  string $base64Tx           Partially-signed transaction (buyer's signature already present)
+     * @param  array  $expectedTransfers  SECURITY-CRITICAL: list of every token transfer this
+     *                                    transaction must contain, e.g.
+     *                                    [['destination' => <wallet pubkey>, 'amount' => 1.23, 'mint' => <mint pubkey>], ...]
+     *                                    The node script decodes the transaction's actual instructions
+     *                                    and refuses to sign (so nothing is broadcast, so the NFT is
+     *                                    never transferred) unless every entry here is found on-chain
+     *                                    in the transaction. Must be computed from the SAME pricing
+     *                                    the buyer was quoted, and passed BEFORE this call — never
+     *                                    sign first and check payment after, since the payment +
+     *                                    NFT-transfer instructions are atomic in one transaction and
+     *                                    a post-hoc check can no longer stop anything.
+     * @param  float  $tolerance          Human-unit tolerance applied to every leg (e.g. for
+     *                                    cross-currency rate drift between quote and confirm).
+     * @param  array  $expectedNftTransfer  SECURITY-CRITICAL, same rationale as $expectedTransfers:
+     *                                    ['asset' => <NFT mint/asset pubkey>, 'newOwner' => <buyer wallet>,
+     *                                    'authority' => <platform delegate wallet>]. Payment legs alone
+     *                                    don't prove WHICH NFT this transaction's mpl-core TransferV1
+     *                                    instruction moves or to whom — the node script refuses to sign
+     *                                    unless this is found on-chain in the transaction too.
      * @return array{success: bool, signature?: string, error?: string}
      */
-    public function coSignAndSubmit(string $base64Tx): array
+    public function coSignAndSubmit(string $base64Tx, array $expectedTransfers, float $tolerance = 0.0, array $expectedNftTransfer = []): array
     {
         if (!file_exists($this->scriptPath)) {
             Log::error('Solana signer: node script missing', ['path' => $this->scriptPath]);
             return ['success' => false, 'error' => 'Signing service is not installed on this server.'];
+        }
+
+        if (empty($expectedTransfers)) {
+            // Defense in depth: this should never happen since callers always
+            // compute pricing first, but never let an empty/omitted expected-
+            // transfers list silently fall through to a blind co-sign.
+            Log::error('Solana signer: coSignAndSubmit called without expectedTransfers');
+            return ['success' => false, 'error' => 'Payment could not be verified for this transaction.'];
+        }
+
+        if (empty($expectedNftTransfer['asset']) || empty($expectedNftTransfer['newOwner'])) {
+            // Same defense in depth, for the NFT-transfer leg: without this,
+            // a transaction could pass payment verification while its
+            // mpl-core TransferV1 instruction moves a completely different
+            // asset (or to a different wallet) than the one being sold.
+            Log::error('Solana signer: coSignAndSubmit called without expectedNftTransfer');
+            return ['success' => false, 'error' => 'NFT transfer could not be verified for this transaction.'];
         }
 
         $keypairPath = config('services.platform.delegate_keypair_path');
@@ -130,7 +166,12 @@ class SolanaSignerService
             $env
         );
 
-        $process->setInput($base64Tx);
+        $process->setInput(json_encode([
+            'signedTx'             => $base64Tx,
+            'expectedTransfers'    => $expectedTransfers,
+            'expectedNftTransfer'  => $expectedNftTransfer,
+            'tolerance'            => $tolerance,
+        ]));
         $process->setTimeout(60);
 
         try {

@@ -3,6 +3,7 @@
 namespace App\Http\Controllers;
 
 use App\Models\Nft;
+use App\Models\PlatformSetting;
 use App\Services\SolanaService;
 use App\Services\SolanaSignerService;
 use Illuminate\Http\Request;
@@ -54,7 +55,7 @@ class BuyController extends Controller
         // PlatformSetting key), since "first N buyers of THIS drop" is
         // meant to vary per collection/drop, unlike the discount %
         // itself which is one global promotion setting.
-        $buyerDiscountPercent = (float) \App\Models\PlatformSetting::get('buyer_discount_percent', 0);
+        $buyerDiscountPercent = (float) PlatformSetting::get('buyer_discount_percent', 0);
         $hasBuyerDiscount     = $buyerDiscountPercent > 0;
         $buyerDiscountMaxUses = (int) ($nft->buyer_discount_max_uses ?? 0);
 
@@ -173,23 +174,6 @@ class BuyController extends Controller
             'buyer_wallet' => $request->buyer_wallet,
         ]);
 
-        // ── Co-sign + broadcast ──────────────────────────────
-        // The buyer has already signed this transaction (payment
-        // instructions + the mpl-core NFT-transfer instruction, which
-        // names the platform as delegate authority). We add the
-        // platform's signature and submit it ourselves — this is what
-        // actually moves NFT ownership on-chain, not just a DB update.
-        $submission = $this->signer->coSignAndSubmit($request->signed_tx);
-
-        if (!($submission['success'] ?? false)) {
-            return response()->json([
-                'success' => false,
-                'message' => $submission['error'] ?? 'Transaction failed to submit. The NFT was not transferred and you were not charged.',
-            ], 422);
-        }
-
-        $signature = $submission['signature'];
-
         // ── Race-condition fix: "first N buyers" discount ────────────
         // calculatePricing() decides eligibility by COUNTING already-sold
         // NFTs in this collection. Without a lock, two buyers confirming
@@ -202,6 +186,10 @@ class BuyController extends Controller
         // already committed. Items with no collection have nothing to
         // race over (their own sold_to state is checked via is_listed
         // above), so no lock is needed for those.
+        //
+        // The lock now wraps EVERYTHING, including signing/broadcast —
+        // not just the DB write — because pricing (computed under the
+        // lock) is what we tell the signer to verify before it signs.
         $discountLock = $nft->collection_id
             ? Cache::lock("buy-confirm:collection:{$nft->collection_id}", 20)
             : null;
@@ -222,25 +210,18 @@ class BuyController extends Controller
                 }
             }
 
-            // ── Payment Verification ─────────────────────────────
-            // Broadcasting successfully only proves the transaction (which
-            // includes both the payment AND the NFT transfer instruction)
-            // executed — but recompute the exact same discount → fee →
-            // royalty breakdown the frontend used and double-check each
-            // transfer amount, as defense in depth.
-            //
+            // ── Compute expected payment BEFORE signing anything ─────────
             // list_price (and everything calculatePricing() derives from
             // it) is denominated in whatever currency the seller listed
             // in (list_currency: spump or usdc). The buyer can pay in
-            // either — if it matches list_currency, verify those exact
+            // either — if it matches list_currency, use those exact
             // amounts directly; if it differs, convert via the live
             // SPUMP/USDC rate first (with a tolerance band for rate drift
             // between the buyer's quote and this confirmation). Both are
-            // SPL tokens, so verification always goes through
-            // verifyTokenPayment() — there's no native-SOL payment path.
+            // SPL tokens — there's no native-SOL payment path.
             //
-            // Recomputed *inside* the lock so buyersSoFar reflects any
-            // sale that just committed a moment ago in another request.
+            // Computed *inside* the lock so buyersSoFar reflects any sale
+            // that just committed a moment ago in another request.
             $pricing         = $this->calculatePricing($nft);
             $treasuryWallet  = $this->solana->getTreasuryWallet();
             $listCurrency    = $pricing['list_currency'];
@@ -290,45 +271,78 @@ class BuyController extends Controller
                 ], 500);
             }
 
-            $sellerPaid = $this->solana->verifyTokenPayment(
-                $signature, $mintAddress, $pricing['seller_wallet'], $sellerAmount, $tolerance
-            );
-            $platformPaid = $platformAmount <= 0 || (
-                $treasuryWallet && $this->solana->verifyTokenPayment(
-                    $signature, $mintAddress, $treasuryWallet, $platformAmount, $tolerance
-                )
-            );
-            $royaltyPaid = $royaltyAmount <= 0 || (
-                $pricing['creator_wallet'] && $this->solana->verifyTokenPayment(
-                    $signature, $mintAddress, $pricing['creator_wallet'], $royaltyAmount, $tolerance
-                )
-            );
+            // ── Expected transfers, handed to the signer BEFORE signing ──
+            // SECURITY-CRITICAL: this is the fix for the "payment failed
+            // but NFT transferred anyway" bug. The buyer's transaction is
+            // atomic — payment + the mpl-core NFT-transfer instruction are
+            // in the SAME transaction. Previously we co-signed and
+            // broadcast it first, then checked payment amounts afterwards;
+            // by the time a mismatch was caught, the transfer had already
+            // happened on-chain, irreversibly.
+            //
+            // Now coSignAndSubmit() itself decodes the transaction's
+            // actual instructions and checks destination + amount against
+            // $expectedTransfers BEFORE adding the platform's signature.
+            // If anything doesn't match, it refuses to sign — nothing is
+            // broadcast, so the NFT is never transferred and the buyer is
+            // never charged.
+            $expectedTransfers = [
+                ['destination' => $pricing['seller_wallet'], 'amount' => $sellerAmount, 'mint' => $mintAddress],
+            ];
+            if ($platformAmount > 0 && $treasuryWallet) {
+                $expectedTransfers[] = ['destination' => $treasuryWallet, 'amount' => $platformAmount, 'mint' => $mintAddress];
+            }
+            if ($royaltyAmount > 0 && $pricing['creator_wallet']) {
+                $expectedTransfers[] = ['destination' => $pricing['creator_wallet'], 'amount' => $royaltyAmount, 'mint' => $mintAddress];
+            }
 
-            if (!$sellerPaid || !$platformPaid || !$royaltyPaid) {
-                Log::warning('Buy confirm blocked: payment not found in transaction', [
-                    'nft_id'           => $nft->id,
-                    'transaction_sig'  => $signature,
-                    'list_currency'    => $listCurrency,
-                    'payment_currency' => $paymentCurrency,
-                    'expected_seller'  => $sellerAmount,
-                    'expected_platform'=> $platformAmount,
-                    'expected_royalty' => $royaltyAmount,
-                    'treasury_wallet'  => $treasuryWallet,
+            // SECURITY-CRITICAL, same rationale as $expectedTransfers above:
+            // proves the transaction's mpl-core TransferV1 instruction moves
+            // THIS NFT (not some other asset the platform delegate also has
+            // authority over) to THIS buyer. Without this, correct payment
+            // alone would be enough to get the platform to co-sign a
+            // transfer of a different, more valuable NFT to the buyer.
+            $expectedNftTransfer = [
+                'asset'     => $nft->mint_address,
+                'newOwner'  => $request->buyer_wallet,
+                'authority' => $this->solana->getDelegateWallet(),
+            ];
+
+            // ── Verify-then-co-sign + broadcast ───────────────────────────
+            // The buyer has already signed this transaction (payment
+            // instructions + the mpl-core NFT-transfer instruction, which
+            // names the platform as delegate authority). We only add the
+            // platform's signature and submit it if $expectedTransfers
+            // matches what the transaction actually instructs — this is
+            // what actually moves NFT ownership on-chain, not just a DB
+            // update, so it must not happen on an unverified payment.
+            $submission = $this->signer->coSignAndSubmit($request->signed_tx, $expectedTransfers, $tolerance, $expectedNftTransfer);
+
+            if (!($submission['success'] ?? false)) {
+                Log::warning('Buy confirm blocked: signer refused to co-sign/broadcast', [
+                    'nft_id'             => $nft->id,
+                    'buyer_wallet'       => $request->buyer_wallet,
+                    'payment_currency'   => $paymentCurrency,
+                    'expected_transfers' => $expectedTransfers,
+                    'error'              => $submission['error'] ?? null,
                 ]);
-
-                $unit = strtoupper($paymentCurrency);
                 return response()->json([
                     'success' => false,
-                    'message' => "Payment not found in this transaction. Expected {$sellerAmount} {$unit} to the seller, {$platformAmount} {$unit} to the platform"
-                        . ($royaltyAmount > 0 ? ", and {$royaltyAmount} {$unit} royalty to the creator." : '.'),
+                    'message' => $submission['error'] ?? 'Transaction failed to submit. The NFT was not transferred and you were not charged.',
                 ], 422);
             }
 
+            $signature = $submission['signature'];
             $salePrice = $pricing['price_after_discount'];
 
             // DB to ownership transfer — still inside the lock, so the
             // next waiting confirm() for this collection only proceeds
             // (and only counts this sale) once it's fully committed.
+            //
+            // Broadcast having succeeded IS the source of truth here: the
+            // signer already verified the payment before signing, so by
+            // the time we get here the transfer is confirmed on-chain and
+            // this DB write is just catching up to reality.
             DB::transaction(function () use ($nft, $request, $salePrice, $signature, $listCurrency) {
                 $previousOwner = $nft->wallet_address;
 
