@@ -40,42 +40,43 @@ return [
     | Pinata IPFS Configuration
     |--------------------------------------------------------------------------
     */
-    'pinata' => [
-        'api_key'    => env('PINATA_API_KEY'),
-        'secret_key' => env('PINATA_SECRET_API_KEY'),
-        'gateway'    => env('PINATA_GATEWAY', 'https://ipfs.io/ipfs/'),
-    ],
-
+    // Pinata (IPFS) — removed. Images/metadata are now stored on local
+    // disk via App\Services\LocalStorageService (storage/app/public).
     /*
     |--------------------------------------------------------------------------
     | Solana Configuration
     |--------------------------------------------------------------------------
     */
     'solana' => [
-        'network'     => env('SOLANA_NETWORK', 'devnet'),
-        'rpc_url'     => env('SOLANA_RPC_URL', 'https://api.devnet.solana.com'),
+        'network' => env('SOLANA_NETWORK', 'devnet'),
+        'rpc_url' => env('SOLANA_RPC_URL', 'https://api.devnet.solana.com'),
         'node_binary' => env('NODE_BINARY_PATH', 'node'),
     ],
 
     'platform' => [
-        'fee_percent'            => env('PLATFORM_FEE_PERCENT', 3),
-        'wallet'                 => env('PLATFORM_WALLET'),
-        // Separate hot wallet used ONLY as the mpl-core TransferDelegate
-        // authority for marketplace sales — deliberately not the same
-        // key as the fee-receiving treasury wallet above, so a
-        // compromise of one doesn't automatically compromise the other.
-        'delegate_wallet'        => env('PLATFORM_DELEGATE_WALLET'),
-        'delegate_keypair_path'  => env('PLATFORM_DELEGATE_KEYPAIR_PATH'),
+    'fee_percent' => env('PLATFORM_FEE_PERCENT', 3),
+    'wallet'      => env('PLATFORM_WALLET'),
+    'delegate_wallet'        => env('PLATFORM_DELEGATE_WALLET'),
+    'delegate_keypair_path'  => env('PLATFORM_DELEGATE_KEYPAIR_PATH'),
     ],
 
-    // The two accepted SPL-token payment currencies across the
-    // platform (mint, list, buy) — SPUMP is the primary/reference
-    // currency; USDC is the alternative. SOL is not accepted as a
-    // payment currency anywhere except the network/gas fee, which is
-    // always paid in SOL regardless (a Solana protocol requirement).
+    // The two accepted SPL-token payment currencies across the platform
+    // (mint, list, buy) — SPUMP is the primary/reference currency; USDC
+    // is the alternative. SOL is not a payment currency anywhere except
+    // the network/gas fee, which is always paid in SOL regardless (a
+    // Solana protocol requirement).
+    //
+    // IMPORTANT: SPUMP_MINT_ADDRESS must be set in .env or every
+    // SPUMP/USDC rate lookup (mint pricing, purchase pricing) will fail
+    // silently and the frontend will show "Loading rate..." forever.
     'tokens' => [
         'spump_mint' => env('SPUMP_MINT_ADDRESS'),
         'usdc_mint'  => env('USDC_MINT_ADDRESS', '4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU'), // devnet USDC default
+        // Final-resort rate fallback: a known-good SPUMP/USDC pool's own
+        // Dexscreener pair address, read directly if every other rate
+        // source (Jupiter, Raydium, Dexscreener-by-mint) fails. Override
+        // in .env as SPUMP_USDC_POOL_ADDRESS if the pool migrates.
+        'spump_usdc_pool' => env('SPUMP_USDC_POOL_ADDRESS', '2gkymgcngo7ZVJD4899cHkJ1B91fkHv3ZnohCuxsU67n'),
     ],
 
 ];

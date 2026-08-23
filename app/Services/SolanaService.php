@@ -299,12 +299,16 @@ class SolanaService
      * Live SPUMP↔USDC rate — shared by mint and buy/sell flows so there's
      * one source of truth. Cached 60s (successful lookups only).
      *
-     * Source chain: Jupiter is PRIMARY (Price API, falling back internally
-     * to Jupiter's own Quote API for low-liquidity pools it won't index a
-     * confident price for). If Jupiter is unreachable/down entirely — not
-     * just "no confident price", but the API itself failing — Raydium's
-     * public pool API is tried as a SECONDARY, independent source, since
-     * it doesn't depend on Jupiter's infrastructure at all.
+     * Source chain, in order, each tried only if the one before it fails:
+     *   1. Jupiter    — Price API, falling back internally to Jupiter's own
+     *                   Quote API for low-liquidity pools it won't index a
+     *                   confident price for.
+     *   2. Raydium    — independent of Jupiter's infrastructure entirely.
+     *   3. Dexscreener (by mint address) — picks the highest-liquidity
+     *                   pair Dexscreener has indexed for this token.
+     *   4. Dexscreener (by known pool address) — most specific/guaranteed
+     *                   fallback: reads the exact SPUMP/USDC pool directly
+     *                   by its pair address, bypassing any search/matching.
      */
     public function getSpumpUsdcRate(): ?array
     {
@@ -328,18 +332,31 @@ class SolanaService
             return null;
         }
 
-        $result = $this->getSpumpUsdcRateViaJupiter($spumpMint, $usdcMint);
+        $sources = [
+            'jupiter'     => fn () => $this->getSpumpUsdcRateViaJupiter($spumpMint, $usdcMint),
+            'raydium'     => fn () => $this->getSpumpUsdcRateViaRaydium($spumpMint, $usdcMint),
+            'dexscreener' => fn () => $this->getSpumpUsdcRateViaDexscreenerToken($spumpMint, $usdcMint),
+            'dexscreener_pool' => fn () => $this->getSpumpUsdcRateViaDexscreenerPool($spumpMint, $usdcMint),
+        ];
 
-        if ($result === null) {
-            \Illuminate\Support\Facades\Log::warning('SPUMP/USDC rate: Jupiter (primary) failed, trying Raydium (secondary)', [
+        $result = null;
+        $tried  = [];
+
+        foreach ($sources as $name => $attempt) {
+            $tried[] = $name;
+            $result  = $attempt();
+            if ($result !== null) {
+                break;
+            }
+            \Illuminate\Support\Facades\Log::warning("SPUMP/USDC rate: {$name} failed, trying next source", [
                 'spump_mint' => $spumpMint,
                 'usdc_mint'  => $usdcMint,
             ]);
-            $result = $this->getSpumpUsdcRateViaRaydium($spumpMint, $usdcMint);
         }
 
         if ($result === null) {
-            \Illuminate\Support\Facades\Log::error('SPUMP/USDC rate: both Jupiter and Raydium failed', [
+            \Illuminate\Support\Facades\Log::error('SPUMP/USDC rate: all sources failed', [
+                'tried'      => $tried,
                 'spump_mint' => $spumpMint,
                 'usdc_mint'  => $usdcMint,
             ]);
@@ -482,28 +499,18 @@ class SolanaService
 
     /**
      * SECONDARY source — only tried when Jupiter (Price API + its own
-     * Quote fallback) fails entirely, e.g. Jupiter's infrastructure is
-     * down/unreachable. Raydium runs independently of Jupiter, so it can
-     * still answer even during a Jupiter outage, as long as the pool is
-     * one Raydium itself hosts.
-     *
-     * Reads the highest-liquidity SPUMP/USDC pool's own reserve amounts
-     * and derives the spot rate directly from the reserve ratio
-     * (spump_reserve / usdc_reserve) — the same approach a constant-
-     * product AMM uses internally for its marginal price. This doesn't
-     * depend on any index/confidence score, only on the pool existing.
+     * Quote fallback) fails entirely. Raydium runs independently of
+     * Jupiter's infrastructure, so it can still answer during a Jupiter
+     * outage. Uses Raydium's own price index (mint/price) — like
+     * Jupiter's Price API, this is confidence-based, so a very
+     * low-liquidity token can still come back empty here too; that's
+     * what the Dexscreener tiers below are for.
      */
     private function getSpumpUsdcRateViaRaydium(string $spumpMint, string $usdcMint): ?array
     {
         try {
-            $response = Http::timeout(10)->get('https://api-v3.raydium.io/pools/info/mint', [
-                'mint1'         => $spumpMint,
-                'mint2'         => $usdcMint,
-                'poolType'      => 'all',
-                'poolSortField' => 'liquidity',
-                'sortType'      => 'desc',
-                'pageSize'      => 1,
-                'page'          => 1,
+            $response = Http::timeout(10)->get('https://api-v3.raydium.io/mint/price', [
+                'mints' => "{$spumpMint},{$usdcMint}",
             ]);
         } catch (Exception $e) {
             \Illuminate\Support\Facades\Log::error('SPUMP/USDC Raydium fallback threw', ['message' => $e->getMessage()]);
@@ -515,71 +522,176 @@ class SolanaService
             return null;
         }
 
-        $body  = $response->json();
-        $pools = $body['data']['data'] ?? $body['data'] ?? null;
+        $body   = $response->json();
+        $prices = $body['data'] ?? null;
 
-        if (!is_array($pools) || count($pools) === 0) {
-            \Illuminate\Support\Facades\Log::error('SPUMP/USDC Raydium fallback: no pool found', ['body' => $body, 'spump_mint' => $spumpMint, 'usdc_mint' => $usdcMint]);
+        $spumpUsdRaw = $prices[$spumpMint] ?? null;
+        $usdcUsdRaw  = $prices[$usdcMint] ?? null;
+
+        if ($spumpUsdRaw === null || $usdcUsdRaw === null) {
+            \Illuminate\Support\Facades\Log::error('SPUMP/USDC Raydium fallback: missing price data', ['body' => $body, 'spump_mint' => $spumpMint, 'usdc_mint' => $usdcMint]);
             return null;
         }
 
-        $pool = $pools[0];
+        $spumpUsd = (float) $spumpUsdRaw;
+        $usdcUsd  = (float) $usdcUsdRaw;
 
-        $mintAAddress = $pool['mintA']['address'] ?? null;
-        $mintBAddress = $pool['mintB']['address'] ?? null;
-        $amountA      = (float) ($pool['mintAmountA'] ?? 0);
-        $amountB      = (float) ($pool['mintAmountB'] ?? 0);
-        $spumpDecimals = (int) ($pool['mintA']['decimals'] ?? $pool['mintB']['decimals'] ?? 6);
-        $usdcDecimals  = (int) ($pool['mintB']['decimals'] ?? $pool['mintA']['decimals'] ?? 6);
-
-        if (!$mintAAddress || !$mintBAddress || $amountA <= 0 || $amountB <= 0) {
-            \Illuminate\Support\Facades\Log::error('SPUMP/USDC Raydium fallback: incomplete pool data', ['pool' => $pool]);
+        if ($spumpUsd <= 0) {
             return null;
         }
-
-        // Reserve amounts from this endpoint are already in human-readable
-        // (decimal-adjusted) units, not raw base units — figure out which
-        // side of the pool is SPUMP vs USDC before taking the ratio.
-        if ($mintAAddress === $spumpMint && $mintBAddress === $usdcMint) {
-            $spumpReserve = $amountA;
-            $usdcReserve  = $amountB;
-            $spumpDecimals = (int) ($pool['mintA']['decimals'] ?? 6);
-            $usdcDecimals  = (int) ($pool['mintB']['decimals'] ?? 6);
-        } elseif ($mintAAddress === $usdcMint && $mintBAddress === $spumpMint) {
-            $spumpReserve = $amountB;
-            $usdcReserve  = $amountA;
-            $spumpDecimals = (int) ($pool['mintB']['decimals'] ?? 6);
-            $usdcDecimals  = (int) ($pool['mintA']['decimals'] ?? 6);
-        } else {
-            \Illuminate\Support\Facades\Log::error('SPUMP/USDC Raydium fallback: pool mints do not match expected pair', ['pool' => $pool, 'spump_mint' => $spumpMint, 'usdc_mint' => $usdcMint]);
-            return null;
-        }
-
-        if ($usdcReserve <= 0) {
-            return null;
-        }
-
-        $spumpPerUsdc = round($spumpReserve / $usdcReserve, 6);
-        if ($spumpPerUsdc <= 0) {
-            return null;
-        }
-
-        // Raydium's pool payload usually includes each side's own USD
-        // price too (from its own price feed) — prefer that for usdc_usd
-        // if present, otherwise assume USDC ≈ $1 (safe for a stablecoin).
-        $usdcUsd = isset($pool['mintB']['price']) && $mintBAddress === $usdcMint
-            ? (float) $pool['mintB']['price']
-            : (isset($pool['mintA']['price']) && $mintAAddress === $usdcMint ? (float) $pool['mintA']['price'] : 1.0);
 
         return [
-            'spump_per_usdc' => $spumpPerUsdc,
-            // Approximate — derived from pool reserve ratio, not a direct
-            // index price. Fine for display purposes.
-            'spump_usd'      => round($usdcUsd / $spumpPerUsdc, 8),
+            'spump_per_usdc' => round($usdcUsd / $spumpUsd, 6),
+            'spump_usd'      => $spumpUsd,
             'usdc_usd'       => $usdcUsd,
-            'decimals'       => $spumpDecimals,
-            'usdc_decimals'  => $usdcDecimals,
+            // Raydium's mint/price response doesn't include decimals —
+            // fall back to the standard 6 both these tokens actually use.
+            'decimals'       => 6,
+            'usdc_decimals'  => 6,
             'source'         => 'raydium',
+        ];
+    }
+
+    /**
+     * TERTIARY source — tried when both Jupiter and Raydium fail. Queries
+     * Dexscreener for every pool it has indexed for the SPUMP mint, picks
+     * the highest-liquidity one, and reads that pool's own priceUsd
+     * directly. Dexscreener computes priceUsd itself from the pool's real
+     * reserves — it isn't a confidence-gated index like the two above, so
+     * it can often answer even for pools too thin for Jupiter/Raydium to
+     * vouch for.
+     */
+    private function getSpumpUsdcRateViaDexscreenerToken(string $spumpMint, string $usdcMint): ?array
+    {
+        try {
+            $response = Http::timeout(10)->get("https://api.dexscreener.com/latest/dex/tokens/{$spumpMint}");
+        } catch (Exception $e) {
+            \Illuminate\Support\Facades\Log::error('SPUMP/USDC Dexscreener (token) fallback threw', ['message' => $e->getMessage()]);
+            return null;
+        }
+
+        if (!$response->successful()) {
+            \Illuminate\Support\Facades\Log::error('SPUMP/USDC Dexscreener (token) fallback failed', ['status' => $response->status(), 'body' => $response->body()]);
+            return null;
+        }
+
+        $pairs = $response->json('pairs');
+        if (!is_array($pairs) || count($pairs) === 0) {
+            \Illuminate\Support\Facades\Log::error('SPUMP/USDC Dexscreener (token) fallback: no pairs found', ['spump_mint' => $spumpMint]);
+            return null;
+        }
+
+        // Prefer a pair actually quoted against USDC if one exists (most
+        // direct); otherwise fall back to whatever pair has the highest
+        // liquidity — Dexscreener's priceUsd is already USD-normalized
+        // regardless of the quote asset, so any pair still gives a usable
+        // spump_usd.
+        $usdcPairs = array_filter($pairs, function ($p) use ($spumpMint, $usdcMint) {
+            $base  = strtolower($p['baseToken']['address']  ?? '');
+            $quote = strtolower($p['quoteToken']['address'] ?? '');
+            return ($base === strtolower($spumpMint) && $quote === strtolower($usdcMint))
+                || ($base === strtolower($usdcMint) && $quote === strtolower($spumpMint));
+        });
+
+        $candidates = count($usdcPairs) > 0 ? array_values($usdcPairs) : $pairs;
+
+        usort($candidates, fn ($a, $b) => (float) ($b['liquidity']['usd'] ?? 0) <=> (float) ($a['liquidity']['usd'] ?? 0));
+        $best = $candidates[0];
+
+        $baseIsSpump = strtolower($best['baseToken']['address'] ?? '') === strtolower($spumpMint);
+        $spumpUsd    = (float) ($best['priceUsd'] ?? 0);
+
+        if ($spumpUsd <= 0) {
+            \Illuminate\Support\Facades\Log::error('SPUMP/USDC Dexscreener (token) fallback: no usable priceUsd', ['pair' => $best]);
+            return null;
+        }
+
+        // If SPUMP is the quote side instead of base for the best pair,
+        // priceUsd refers to the OTHER token — invert.
+        if (!$baseIsSpump) {
+            $otherUsd = $spumpUsd;
+            $spumpUsd = $otherUsd > 0 ? round(1 / $otherUsd, 12) : 0;
+            // This edge case is rare enough (Dexscreener usually returns
+            // the queried token as base) that we bail rather than trust a
+            // shaky inversion.
+            if ($spumpUsd <= 0) {
+                return null;
+            }
+        }
+
+        return [
+            'spump_per_usdc' => round(1 / $spumpUsd, 6),
+            'spump_usd'      => $spumpUsd,
+            'usdc_usd'       => 1.0, // USDC assumed ≈ $1 here; Dexscreener's priceUsd for SPUMP is already USD-denominated
+            'decimals'       => 6,
+            'usdc_decimals'  => 6,
+            'source'         => 'dexscreener',
+        ];
+    }
+
+    /**
+     * QUATERNARY / final source — reads one specific, known-good
+     * SPUMP/USDC pool by its exact pair address, bypassing any
+     * search/matching entirely. This is the most specific and most
+     * reliable fallback of all four, but only covers this ONE pool, so
+     * it's kept last: if that particular pool ever drains or migrates,
+     * the earlier tiers (which discover pools dynamically) still work.
+     */
+    private function getSpumpUsdcRateViaDexscreenerPool(string $spumpMint, string $usdcMint): ?array
+    {
+        $poolAddress = config('services.tokens.spump_usdc_pool');
+        if (!$poolAddress) {
+            return null;
+        }
+
+        try {
+            $response = Http::timeout(10)->get("https://api.dexscreener.com/latest/dex/pairs/solana/{$poolAddress}");
+        } catch (Exception $e) {
+            \Illuminate\Support\Facades\Log::error('SPUMP/USDC Dexscreener (pool) fallback threw', ['message' => $e->getMessage()]);
+            return null;
+        }
+
+        if (!$response->successful()) {
+            \Illuminate\Support\Facades\Log::error('SPUMP/USDC Dexscreener (pool) fallback failed', ['status' => $response->status(), 'body' => $response->body()]);
+            return null;
+        }
+
+        $pairs = $response->json('pairs');
+        $pair  = is_array($pairs) && count($pairs) > 0 ? $pairs[0] : null;
+
+        if (!$pair) {
+            \Illuminate\Support\Facades\Log::error('SPUMP/USDC Dexscreener (pool) fallback: pool not found', ['pool_address' => $poolAddress]);
+            return null;
+        }
+
+        $baseAddress  = strtolower($pair['baseToken']['address']  ?? '');
+        $quoteAddress = strtolower($pair['quoteToken']['address'] ?? '');
+        $priceUsd     = (float) ($pair['priceUsd'] ?? 0);
+
+        if ($priceUsd <= 0) {
+            return null;
+        }
+
+        if ($baseAddress === strtolower($spumpMint)) {
+            $spumpUsd = $priceUsd;
+        } elseif ($quoteAddress === strtolower($spumpMint)) {
+            $spumpUsd = $priceUsd > 0 ? round(1 / $priceUsd, 12) : 0;
+        } else {
+            \Illuminate\Support\Facades\Log::error('SPUMP/USDC Dexscreener (pool) fallback: configured pool does not contain SPUMP mint', ['pool_address' => $poolAddress, 'pair' => $pair]);
+            return null;
+        }
+
+        if ($spumpUsd <= 0) {
+            return null;
+        }
+
+        return [
+            'spump_per_usdc' => round(1 / $spumpUsd, 6),
+            'spump_usd'      => $spumpUsd,
+            'usdc_usd'       => 1.0,
+            'decimals'       => 6,
+            'usdc_decimals'  => 6,
+            'source'         => 'dexscreener',
         ];
     }
 
