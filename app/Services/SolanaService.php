@@ -222,14 +222,16 @@ class SolanaService
     }
 
     /**
-     * Resolve the platform fee percent the same way — DB setting
-     * (admin-editable) overrides the .env default.
+     * Resolve the platform fee — a flat SOL amount (admin-editable via
+     * PlatformSetting 'platform_fee_amount_sol'), no longer a percentage
+     * of the sale price. Falls back to the .env default when no
+     * PlatformSetting row exists yet.
      */
-    public function getPlatformFeePercent(): float
+    public function getPlatformFeeAmountSol(): float
     {
         return (float) \App\Models\PlatformSetting::get(
-            'platform_fee_percent',
-            config('services.platform.fee_percent', 3)
+            'platform_fee_amount_sol',
+            config('services.platform.fee_amount_sol', 0.01)
         );
     }
 
@@ -360,7 +362,27 @@ class SolanaService
                 'spump_mint' => $spumpMint,
                 'usdc_mint'  => $usdcMint,
             ]);
-            return null;
+
+            $fallback = $this->staticFallbackRate('spump_usd_fallback');
+            if ($fallback === null) {
+                return null;
+            }
+
+            // No cache on the fallback path — deliberately re-tries live
+            // sources every call (it's cheap: they fail fast with no
+            // route found), so pricing snaps back to real market data
+            // immediately once it becomes available, instead of being
+            // stuck on a stale static number for up to 60s.
+            \Illuminate\Support\Facades\Log::warning('SPUMP/USDC rate: using static fallback price (live sources unavailable — expected on devnet)', ['spump_usd_fallback' => $fallback]);
+            return [
+                'spump_per_usdc' => round(1 / $fallback, 6),
+                'spump_usd'      => $fallback,
+                'usdc_usd'       => (float) config('services.tokens.usdc_usd_fallback', 1.0),
+                'decimals'       => null,
+                'usdc_decimals'  => null,
+                'source'         => 'static_fallback',
+                'updated_at'     => now()->toDateTimeString(),
+            ];
         }
 
         $result['updated_at'] = now()->toDateTimeString();
@@ -368,6 +390,23 @@ class SolanaService
         Cache::put('spump_price_data', $result, 60);
 
         return $result;
+    }
+
+    /**
+     * Reads a configured static fallback USD price (e.g.
+     * spump_usd_fallback, sol_usd_fallback) — returns null (meaning
+     * "no fallback configured, stay failed") if it isn't set or isn't a
+     * usable positive number, so an admin who hasn't opted into this
+     * still gets the original null/"rate unavailable" behavior.
+     */
+    private function staticFallbackRate(string $configKey): ?float
+    {
+        $value = config("services.tokens.{$configKey}");
+        if ($value === null || $value === '') {
+            return null;
+        }
+        $value = (float) $value;
+        return $value > 0 ? $value : null;
     }
 
     /**
@@ -693,6 +732,179 @@ class SolanaService
             'usdc_decimals'  => 6,
             'source'         => 'dexscreener',
         ];
+    }
+
+    /**
+     * Live SOL↔USDC rate. Admin pricing (mint_price, platform fee) is
+     * now configured in SOL, so this is the other half of every
+     * SOL→SPUMP / SOL→USDC conversion. Reuses the exact same
+     * multi-source fallback chain as getSpumpUsdcRate() (Jupiter →
+     * Raydium → Dexscreener-by-mint) by just pointing those same
+     * mint-agnostic private methods at the wrapped-SOL mint instead of
+     * SPUMP — SOL/USDC is about as deep a pool as exists on Solana, so
+     * the pool-address-specific final tier isn't needed here. Cached
+     * 60s (successful lookups only), same as the SPUMP rate.
+     */
+    public function getSolUsdcRate(): ?array
+    {
+        $cached = Cache::get('sol_price_data');
+        if ($cached !== null) {
+            return $cached;
+        }
+
+        $solMint  = config('services.tokens.sol_mint');
+        $usdcMint = config('services.tokens.usdc_mint');
+
+        if (!$solMint || !$usdcMint) {
+            \Illuminate\Support\Facades\Log::error('SOL/USDC rate unavailable: token mint(s) not configured', [
+                'sol_mint_set'  => (bool) $solMint,
+                'usdc_mint_set' => (bool) $usdcMint,
+            ]);
+            return null;
+        }
+
+        $sources = [
+            'jupiter'     => fn () => $this->getSpumpUsdcRateViaJupiter($solMint, $usdcMint),
+            'raydium'     => fn () => $this->getSpumpUsdcRateViaRaydium($solMint, $usdcMint),
+            'dexscreener' => fn () => $this->getSpumpUsdcRateViaDexscreenerToken($solMint, $usdcMint),
+        ];
+
+        $result = null;
+        $tried  = [];
+
+        foreach ($sources as $name => $attempt) {
+            $tried[] = $name;
+            $result  = $attempt();
+            if ($result !== null) {
+                break;
+            }
+            \Illuminate\Support\Facades\Log::warning("SOL/USDC rate: {$name} failed, trying next source", [
+                'sol_mint'  => $solMint,
+                'usdc_mint' => $usdcMint,
+            ]);
+        }
+
+        if ($result === null) {
+            \Illuminate\Support\Facades\Log::error('SOL/USDC rate: all sources failed', [
+                'tried'    => $tried,
+                'sol_mint' => $solMint,
+            ]);
+
+            $fallback = $this->staticFallbackRate('sol_usd_fallback');
+            if ($fallback === null) {
+                return null;
+            }
+
+            \Illuminate\Support\Facades\Log::warning('SOL/USDC rate: using static fallback price (live sources unavailable — expected on devnet)', ['sol_usd_fallback' => $fallback]);
+            return [
+                'sol_per_usdc'  => round(1 / $fallback, 6),
+                'sol_usd'       => $fallback,
+                'usdc_usd'      => (float) config('services.tokens.usdc_usd_fallback', 1.0),
+                'decimals'      => null,
+                'usdc_decimals' => null,
+                'source'        => 'static_fallback',
+                'updated_at'    => now()->toDateTimeString(),
+            ];
+        }
+
+        // Remap the (mint-agnostic) spump_* keys the shared helpers
+        // return into sol_* keys, for clarity at every SOL call site.
+        $normalized = [
+            'sol_per_usdc'  => $result['spump_per_usdc'],
+            'sol_usd'       => $result['spump_usd'],
+            'usdc_usd'      => $result['usdc_usd'],
+            'decimals'      => $result['decimals'],
+            'usdc_decimals' => $result['usdc_decimals'],
+            'source'        => $result['source'],
+            'updated_at'    => now()->toDateTimeString(),
+        ];
+
+        Cache::put('sol_price_data', $normalized, 60);
+
+        return $normalized;
+    }
+
+    /**
+     * SOL → SPUMP at live rates. Goes through USD rather than needing a
+     * direct SOL/SPUMP pool: sol_usd / spump_usd. Returns null if either
+     * leg's rate is unavailable — callers must treat that as "can't
+     * price this right now", never silently charge/store 0.
+     */
+    public function convertSolToSpump(float $solAmount): ?float
+    {
+        $solRate   = $this->getSolUsdcRate();
+        $spumpRate = $this->getSpumpUsdcRate();
+        if (!$solRate || !$spumpRate || (float) $spumpRate['spump_usd'] <= 0) {
+            return null;
+        }
+        $usdValue = $solAmount * (float) $solRate['sol_usd'];
+        return round($usdValue / (float) $spumpRate['spump_usd'], 6);
+    }
+
+    /**
+     * SOL → USDC at live rates.
+     */
+    public function convertSolToUsdc(float $solAmount): ?float
+    {
+        $solRate = $this->getSolUsdcRate();
+        if (!$solRate || (float) ($solRate['usdc_usd'] ?? 0) <= 0) {
+            return null;
+        }
+        $usdValue = $solAmount * (float) $solRate['sol_usd'];
+        return round($usdValue / (float) $solRate['usdc_usd'], 6);
+    }
+
+    /**
+     * SOL → whichever payment currency string is passed ('spump' or
+     * anything else is treated as 'usdc'). Small dispatch helper used
+     * wherever an admin SOL-denominated setting (mint_price,
+     * platform_fee_amount_sol) needs to be expressed in a specific
+     * listing's actual currency.
+     */
+    public function convertSolTo(float $solAmount, string $currency): ?float
+    {
+        return strtolower($currency) === 'usdc'
+            ? $this->convertSolToUsdc($solAmount)
+            : $this->convertSolToSpump($solAmount);
+    }
+
+    /**
+     * Plain USD → SPUMP at the live rate. Used for the storage fee,
+     * which is admin-configured directly in USD (storage_fee_per_mb_usd)
+     * rather than SOL.
+     */
+    public function convertUsdToSpump(float $usdAmount): ?float
+    {
+        $spumpRate = $this->getSpumpUsdcRate();
+        if (!$spumpRate || (float) $spumpRate['spump_usd'] <= 0) {
+            return null;
+        }
+        return round($usdAmount / (float) $spumpRate['spump_usd'], 6);
+    }
+
+    /**
+     * Plain USD → USDC at the live rate (USDC's own usd price, not
+     * assumed to be exactly 1.0).
+     */
+    public function convertUsdToUsdc(float $usdAmount): ?float
+    {
+        $spumpRate = $this->getSpumpUsdcRate(); // only need its usdc_usd leg
+        $usdcUsd   = $spumpRate['usdc_usd'] ?? null;
+        if (!$usdcUsd || $usdcUsd <= 0) {
+            return null;
+        }
+        return round($usdAmount / (float) $usdcUsd, 6);
+    }
+
+    /**
+     * USD → whichever payment currency string is passed, mirroring
+     * convertSolTo() above.
+     */
+    public function convertUsdTo(float $usdAmount, string $currency): ?float
+    {
+        return strtolower($currency) === 'usdc'
+            ? $this->convertUsdToUsdc($usdAmount)
+            : $this->convertUsdToSpump($usdAmount);
     }
 
     /**

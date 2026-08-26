@@ -36,9 +36,19 @@ class AdminController extends Controller
             ->toArray();
     }
 
-    private function revenueByCurrency(array $volumeByCurrency, float $feePercent): array
+    /**
+     * Platform fee is now a flat SOL amount converted per-sale, not a
+     * fixed percentage of volume — so revenue can no longer be derived
+     * as "volume * fee%". Sum the actual platform_fee_charged column
+     * (recorded at buy-confirm time, see BuyController::confirm())
+     * grouped by currency instead.
+     */
+    private function revenueByCurrency($nfts): array
     {
-        return array_map(fn($vol) => round($vol * ($feePercent / 100), 6), $volumeByCurrency);
+        return $nfts
+            ->groupBy(fn($n) => $n->list_currency ?: 'spump')
+            ->map(fn($group) => (float) $group->sum('platform_fee_charged'))
+            ->toArray();
     }
 
     private function checkAdmin(Request $request): ?JsonResponse
@@ -86,10 +96,9 @@ class AdminController extends Controller
     {
         if ($err = $this->checkAdmin($request)) return $err;
 
-        $soldNfts    = Nft::whereNotNull('sold_to')->get(['list_currency', 'sold_price']);
-        $feePercent  = (float) PlatformSetting::get('platform_fee_percent', 3);
+        $soldNfts    = Nft::whereNotNull('sold_to')->get(['list_currency', 'sold_price', 'platform_fee_charged']);
         $volumes     = $this->volumeByCurrency($soldNfts);
-        $revenues    = $this->revenueByCurrency($volumes, $feePercent);
+        $revenues    = $this->revenueByCurrency($soldNfts);
 
         return response()->json([
             'success' => true,
@@ -194,10 +203,9 @@ class AdminController extends Controller
         if ($request->from) $query->whereDate('sold_at', '>=', $request->from);
         if ($request->to)   $query->whereDate('sold_at', '<=', $request->to);
 
-        $soldNfts   = Nft::whereNotNull('sold_to')->get(['list_currency', 'sold_price']);
-        $feePercent = (float) PlatformSetting::get('platform_fee_percent', 3);
+        $soldNfts   = Nft::whereNotNull('sold_to')->get(['list_currency', 'sold_price', 'platform_fee_charged']);
         $volumes    = $this->volumeByCurrency($soldNfts);
-        $revenues   = $this->revenueByCurrency($volumes, $feePercent);
+        $revenues   = $this->revenueByCurrency($soldNfts);
 
         return response()->json([
             'success' => true,
@@ -316,35 +324,59 @@ class AdminController extends Controller
     public function publicConfig(): JsonResponse
     {
         $isFreeListing       = PlatformSetting::get('is_free_listing', true);
-        // mint_price is now the SPUMP-denominated canonical price (admin
-        // sets this directly in SPUMP) — there is no SOL mint price
-        // anymore. USDC is derived live from the Jupiter SPUMP/USDC rate,
-        // same source BuyController uses for purchase pricing.
-        $mintPriceSpump      = (float) PlatformSetting::get('mint_price', 10);
-        $mintDiscountPercent = (float) PlatformSetting::get('mint_discount_percent', 15);
+        // mint_price / platform_fee_amount_sol are now admin-configured
+        // in SOL, and storage_fee_per_mb_usd in plain USD — SOL is
+        // never exposed to the frontend as a payment option, these are
+        // only the BASE the SPUMP figures below get converted from live
+        // (same Jupiter SPUMP/USDC + SOL/USDC rates BuyController uses
+        // for purchase pricing). If a rate is unavailable, the *_spump
+        // fields below fall back to 0 and 'rate_unavailable' is true —
+        // the frontend should treat that the same as its existing
+        // "Loading rate..." state.
+        $mintPriceSol         = (float) PlatformSetting::get('mint_price', 0.05);
+        $mintDiscountPercent  = (float) PlatformSetting::get('mint_discount_percent', 15);
+        $platformFeeAmountSol = (float) PlatformSetting::get('platform_fee_amount_sol', 0.01);
+        $storageFeePerMbUsd   = (float) PlatformSetting::get('storage_fee_per_mb_usd', 0.01);
+
+        $rate = $this->solana->getSpumpUsdcRate();
+
+        $mintPriceSpump = $isFreeListing ? 0 : $this->solana->convertSolToSpump($mintPriceSol);
+        $platformFeeSpump = $this->solana->convertSolToSpump($platformFeeAmountSol);
+        $storageFeePerMbSpump = $this->solana->convertUsdToSpump($storageFeePerMbUsd);
+
+        $rateUnavailable = $rate === null || ($mintPriceSpump === null && !$isFreeListing) || $platformFeeSpump === null || $storageFeePerMbSpump === null;
+
+        $mintPriceSpump       = $mintPriceSpump ?? 0;
+        $platformFeeSpump     = $platformFeeSpump ?? 0;
+        $storageFeePerMbSpump = $storageFeePerMbSpump ?? 0;
 
         $discountAmount     = $isFreeListing ? 0 : round($mintPriceSpump * ($mintDiscountPercent / 100), 6);
         $priceAfterDiscount = $isFreeListing ? 0 : round($mintPriceSpump - $discountAmount, 6);
 
-        $rate = $this->solana->getSpumpUsdcRate();
-
         return response()->json([
             'success' => true,
             'data'    => [
-                'platform_fee_percent'  => PlatformSetting::get('platform_fee_percent', 3),
+                // Informational — admin's SOL/USD-denominated base, not
+                // a payment option.
+                'mint_price_sol'          => $isFreeListing ? 0 : $mintPriceSol,
+                'platform_fee_amount_sol' => $platformFeeAmountSol,
+                'storage_fee_per_mb_usd'  => $storageFeePerMbUsd,
+
                 'is_free_listing'       => $isFreeListing,
                 'mint_price_spump'      => $mintPriceSpump,
                 'mint_discount_percent' => $mintDiscountPercent,
                 'discount_amount'       => $discountAmount,
                 'price_after_discount'  => $priceAfterDiscount,
                 'buyer_discount_percent'=> PlatformSetting::get('buyer_discount_percent', 10),
-                'storage_fee_per_mb_spump' => (float) PlatformSetting::get('storage_fee_per_mb_spump', 10),
+                'platform_fee_spump'    => $platformFeeSpump,
+                'storage_fee_per_mb_spump' => $storageFeePerMbSpump,
                 'spump_per_usdc'        => $rate['spump_per_usdc'] ?? null,
                 'spump_mint'            => config('services.tokens.spump_mint'),
                 'usdc_mint'             => config('services.tokens.usdc_mint'),
                 'platform_wallet'       => PlatformSetting::get('platform_wallet', '') ?: config('services.platform.wallet', ''),
                 'delegate_wallet'       => PlatformSetting::get('delegate_wallet', '') ?: config('services.platform.delegate_wallet', ''),
                 'network'               => config('services.solana.network', 'devnet'),
+                'rate_unavailable'      => $rateUnavailable,
             ],
         ]);
     }

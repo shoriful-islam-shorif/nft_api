@@ -113,8 +113,35 @@ class NftController extends Controller
         // free regardless of what the admin actually configured, since
         // mint()'s payment check later only looks at what got stored
         // here on this row.
-        $isFree          = (bool)  PlatformSetting::get('is_free_listing', true);
-        $mintPrice       = $isFree ? 0 : (float) PlatformSetting::get('mint_price', 10);
+        $isFree = (bool) PlatformSetting::get('is_free_listing', true);
+
+        // mint_price is now admin-configured in SOL; storage fee (added
+        // to baseRow further below) is admin-configured in USD. Both
+        // get converted to SPUMP — this platform's canonical internal
+        // currency — via the live rate. Pre-warm/verify that rate HERE,
+        // before the slow/irreversible image upload in Step 1 below:
+        // failing fast here is cheap, failing after the image is
+        // already on disk is not. Because getSpumpUsdcRate() caches for
+        // 60s, this same lookup is what the storage-fee conversion a
+        // few lines later will reuse, so it isn't fetched twice.
+        if (!$this->solana->getSpumpUsdcRate()) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Unable to price this mint right now (rate unavailable). Please try again shortly.',
+            ], 503);
+        }
+
+        $mintPrice = 0; // SPUMP — stays 0 for free listings
+        if (!$isFree) {
+            $mintPriceSol = (float) PlatformSetting::get('mint_price', 0.05);
+            $mintPrice    = $this->solana->convertSolToSpump($mintPriceSol);
+            if ($mintPrice === null) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Unable to price this mint right now (SOL rate unavailable). Please try again shortly.',
+                ], 503);
+            }
+        }
         $hasMintDiscount = !$isFree && (float) PlatformSetting::get('mint_discount_percent', 0) > 0;
         $discountPercent = $hasMintDiscount ? (float) PlatformSetting::get('mint_discount_percent', 0) : 0;
         $networkFee      = self::NETWORK_FEE_SOL;
@@ -169,6 +196,20 @@ class NftController extends Controller
             // ── Step 3: Metadata → local disk ────────
             $metadataResult = $this->storage->uploadMetadata($metadata);
 
+            // Storage fee: admin-configured in USD, converted to SPUMP
+            // live (same reasoning as mint_price above). The rate was
+            // already verified reachable before the image upload, so
+            // this should only fail here if it changed availability in
+            // the last few seconds — checked anyway rather than
+            // silently storing a wrong (null→0) fee.
+            $storageFeeSpump = $this->storageFee->calculateAnnualFeeSpump($imageResult['size_bytes']);
+            if ($storageFeeSpump === null) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Unable to finalize storage pricing (rate unavailable). Please try again.',
+                ], 503);
+            }
+
             //Step 4: DB Save 
             // Edition / Total Supply fix: a "limited" edition of N must
             // actually produce N independently-mintable rows (each will
@@ -189,7 +230,7 @@ class NftController extends Controller
                 'image_url'              => $imageResult['url'],
                 'image_hash'             => $imageResult['ipfs_hash'],
                 'image_size_bytes'       => $imageResult['size_bytes'],
-                'storage_fee_spump'      => $this->storageFee->calculateAnnualFeeSpump($imageResult['size_bytes']),
+                'storage_fee_spump'      => $storageFeeSpump,
                 'metadata_uri'           => $metadataResult['metadata_uri'],
                 'metadata_hash'          => $metadataResult['ipfs_hash'],
                 'collection_id'          => $request->collection_id,
@@ -254,6 +295,11 @@ class NftController extends Controller
                     'wallet'           => $request->wallet_address,
                     'network'          => $this->solana->getNetwork(),
                     'pricing'          => [
+                        // Informational only — the frontend never lets a
+                        // user pick SOL as a payment currency, this just
+                        // shows the admin-configured base the SPUMP
+                        // figure below was converted from.
+                        'mint_price_sol'       => $isFree ? 0 : (float) PlatformSetting::get('mint_price', 0.05),
                         'mint_price'           => $mintPrice . ' SPUMP',
                         'discount'             => $discountPercent . '%',
                         'price_after_discount' => $priceAfter . ' SPUMP',
@@ -551,6 +597,12 @@ class NftController extends Controller
             // mint-time cached value) — a renewal is a new purchase of
             // another year at whatever the rate is now.
             $renewalFeeSpump = $this->storageFee->calculateAnnualFeeSpump($nft->image_size_bytes);
+            if ($renewalFeeSpump === null) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Unable to price storage renewal right now (rate unavailable). Please try again shortly.',
+                ], 422);
+            }
 
             $treasuryWallet  = $this->solana->getTreasuryWallet();
             $paymentCurrency = $request->input('payment_currency', 'spump');

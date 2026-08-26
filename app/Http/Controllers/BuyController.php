@@ -37,10 +37,11 @@ class BuyController extends Controller
      */
     private function calculatePricing(Nft $nft): array
     {
-        $listPrice = (float) $nft->list_price;
+        $listPrice    = (float) $nft->list_price;
+        $listCurrency = $nft->list_currency ?: 'spump';
 
         // has_buyer_discount / buyer_discount_percent are PLATFORM-WIDE
-        // admin settings (same category as platform_fee_percent below) —
+        // admin settings (same category as the platform fee below) —
         // read LIVE from PlatformSetting here, not from this NFT row's
         // own stored columns. Those columns are only a snapshot captured
         // at mint time (see NftController::create()); reading them here
@@ -78,8 +79,17 @@ class BuyController extends Controller
 
         $priceAfterDiscount = round($listPrice - $buyerDiscountAmount, 6);
 
-        $platformFeePercent = $this->solana->getPlatformFeePercent();
-        $platformFee        = round($priceAfterDiscount * $platformFeePercent / 100, 6);
+        // Platform fee is now a flat SOL amount (admin-configured via
+        // 'platform_fee_amount_sol'), not a percentage of the sale
+        // price — converted live into whatever currency this NFT is
+        // actually listed in, same conversion approach mint_price and
+        // the storage fee use. If the rate is unavailable, fail closed
+        // (pricing_unavailable=true) rather than silently charging a
+        // 0 platform fee — prepare()/confirm() check this flag.
+        $platformFeeAmountSol = $this->solana->getPlatformFeeAmountSol();
+        $platformFee          = $this->solana->convertSolTo($platformFeeAmountSol, $listCurrency);
+        $pricingUnavailable   = $platformFee === null;
+        $platformFee          = $platformFee ?? 0.0;
 
         // Royalty only applies on a resale (current owner !== original creator).
         $creatorWallet = $nft->creator_wallet;
@@ -93,15 +103,16 @@ class BuyController extends Controller
 
         return [
             'list_price'             => $listPrice,
-            'list_currency'          => $nft->list_currency ?: 'spump',
+            'list_currency'          => $listCurrency,
             'is_discount_eligible'   => $isDiscountEligible,
             'buyer_discount_percent' => $buyerDiscountPercent,
             'buyer_discount_amount'  => $buyerDiscountAmount,
             'buyer_discount_max_uses'=> $buyerDiscountMaxUses,
             'buyers_so_far'          => $buyersSoFar,
             'price_after_discount'  => $priceAfterDiscount,
-            'platform_fee_percent'  => $platformFeePercent,
+            'platform_fee_amount_sol'=> $platformFeeAmountSol,
             'platform_fee'          => $platformFee,
+            'pricing_unavailable'   => $pricingUnavailable,
             'is_resale'             => $isResale,
             'royalty_percent'       => $royaltyPercent,
             'royalty_amount'        => $royaltyAmount,
@@ -129,6 +140,13 @@ class BuyController extends Controller
 
         $pricing = $this->calculatePricing($nft);
 
+        if ($pricing['pricing_unavailable']) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Unable to price this item right now (rate unavailable). Please try again shortly.',
+            ], 503);
+        }
+
         return response()->json([
             'success' => true,
             'data'    => array_merge($pricing, [
@@ -138,8 +156,6 @@ class BuyController extends Controller
                 'mint_address' => $nft->mint_address,
                 'platform_wallet' => $this->solana->getTreasuryWallet(),
                 'delegate_wallet' => $this->solana->getDelegateWallet(),
-                // Back-compat aliases for existing frontend fields
-                'platform_fee_pct' => $pricing['platform_fee_percent'],
             ]),
         ]);
     }
@@ -222,7 +238,16 @@ class BuyController extends Controller
             //
             // Computed *inside* the lock so buyersSoFar reflects any sale
             // that just committed a moment ago in another request.
-            $pricing         = $this->calculatePricing($nft);
+            $pricing = $this->calculatePricing($nft);
+
+            if ($pricing['pricing_unavailable']) {
+                Log::error('Buy confirm blocked: platform fee rate unavailable', ['nft_id' => $nft->id]);
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Unable to price this item right now (rate unavailable). Please try again shortly.',
+                ], 503);
+            }
+
             $treasuryWallet  = $this->solana->getTreasuryWallet();
             $listCurrency    = $pricing['list_currency'];
             $paymentCurrency = $request->input('payment_currency', $listCurrency);
@@ -343,7 +368,14 @@ class BuyController extends Controller
             // signer already verified the payment before signing, so by
             // the time we get here the transfer is confirmed on-chain and
             // this DB write is just catching up to reality.
-            DB::transaction(function () use ($nft, $request, $salePrice, $signature, $listCurrency) {
+            // Stored in list_currency (== sold_currency below), matching
+            // $salePrice — NOT $platformAmount above, which may have
+            // been converted into paymentCurrency if the buyer paid in
+            // the other token. Keeps sold_price/platform_fee_charged/
+            // sold_currency internally consistent for admin reporting.
+            $platformFeeChargedInListCurrency = $pricing['platform_fee'];
+
+            DB::transaction(function () use ($nft, $request, $salePrice, $signature, $listCurrency, $platformFeeChargedInListCurrency) {
                 $previousOwner = $nft->wallet_address;
 
                 $nft->update([
@@ -357,6 +389,11 @@ class BuyController extends Controller
                     'sold_at'         => now(),
                     'sold_tx'         => $signature,
                     'previous_owner'  => $previousOwner,
+                    // Actual flat platform fee charged, in sold_currency —
+                    // the platform fee is no longer a fixed % of volume,
+                    // so admin revenue reporting sums this column instead
+                    // of recomputing a percentage after the fact.
+                    'platform_fee_charged' => $platformFeeChargedInListCurrency,
                 ]);
             });
         } finally {
