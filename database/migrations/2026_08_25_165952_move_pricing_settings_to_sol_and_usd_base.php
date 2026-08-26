@@ -34,15 +34,15 @@ return new class extends Migration
 
         DB::table('platform_settings')->updateOrInsert(
             ['key' => 'mint_price'],
-            ['value' => '0.05', 'type' => 'number', 'label' => 'Mint Price (SOL)', 'updated_at' => $now, 'created_at' => $now]
+            ['value' => '0', 'type' => 'number', 'label' => 'Mint Price (SOL)', 'updated_at' => $now, 'created_at' => $now]
         );
         DB::table('platform_settings')->updateOrInsert(
             ['key' => 'platform_fee_amount_sol'],
-            ['value' => '0.01', 'type' => 'number', 'label' => 'Platform Fee (SOL, flat amount per sale)', 'updated_at' => $now, 'created_at' => $now]
+            ['value' => '0', 'type' => 'number', 'label' => 'Platform Fee (SOL, flat amount per sale)', 'updated_at' => $now, 'created_at' => $now]
         );
         DB::table('platform_settings')->updateOrInsert(
             ['key' => 'storage_fee_per_mb_usd'],
-            ['value' => '0.01', 'type' => 'number', 'label' => 'Storage Fee — USD per MB per year', 'updated_at' => $now, 'created_at' => $now]
+            ['value' => '0', 'type' => 'number', 'label' => 'Storage Fee — USD per MB per year', 'updated_at' => $now, 'created_at' => $now]
         );
     }
 
